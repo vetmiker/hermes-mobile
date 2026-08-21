@@ -36,12 +36,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
@@ -64,7 +64,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
@@ -78,15 +81,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.m57.hermescontrol.HistoryScreen
 import com.m57.hermescontrol.NavigationController
 import com.m57.hermescontrol.R
-import com.m57.hermescontrol.SettingsAbout
 import com.m57.hermescontrol.data.model.Attachment
 import com.m57.hermescontrol.data.model.AttachmentSource
-import com.m57.hermescontrol.data.update.AppUpdateCache
-import com.m57.hermescontrol.data.update.AppUpdateState
-import com.m57.hermescontrol.data.update.UpdateNoticeManager
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.glasses.GlassesModeControllerProvider
+import com.m57.hermescontrol.glasses.GlassesModeSnapshot
 import com.m57.hermescontrol.glasses.GlassesModeState
 import com.m57.hermescontrol.glasses.myvu.GlassesFontMode
 import com.m57.hermescontrol.glasses.myvu.GlassesReadabilityStore
@@ -111,7 +111,6 @@ import com.m57.hermescontrol.ui.common.AutoScrollingTitleText
 import com.m57.hermescontrol.ui.common.CredentialWarningBanner
 import com.m57.hermescontrol.ui.common.HermesScaffold
 import com.m57.hermescontrol.ui.common.NavIcon
-import com.m57.hermescontrol.ui.common.UpdateNoticeBanner
 import com.m57.hermescontrol.ui.model.components.ModelPickerDialog
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
@@ -123,6 +122,55 @@ import java.util.Date
 import java.util.Locale
 
 private const val SESSION_SYNC_INTERVAL_MS = 30_000L
+
+internal enum class GlassesChatAffordance {
+    Start,
+    Switch,
+    Starting,
+    Connected,
+    Suspended,
+    Error,
+}
+
+private fun glassesModeStatusResource(state: GlassesModeState): Int =
+    when (state) {
+        GlassesModeState.LISTENING,
+        GlassesModeState.TRANSCRIBING,
+        GlassesModeState.AWAITING_HERMES,
+        GlassesModeState.RENDERING,
+        GlassesModeState.PHONE_PRIORITY,
+        -> R.string.glasses_status_connected
+        GlassesModeState.STARTING -> R.string.glasses_status_starting
+        GlassesModeState.SUSPENDED -> R.string.glasses_status_suspended
+        GlassesModeState.ERROR -> R.string.glasses_status_error
+        GlassesModeState.INACTIVE -> R.string.glasses_status_inactive
+    }
+
+internal fun glassesChatAffordance(
+    snapshot: GlassesModeSnapshot,
+    visibleStoredSessionId: String?,
+): GlassesChatAffordance {
+    val isCurrentChat = snapshot.storedSessionId == visibleStoredSessionId
+    if (!isCurrentChat || snapshot.state == GlassesModeState.INACTIVE) {
+        return if (snapshot.state == GlassesModeState.INACTIVE) {
+            GlassesChatAffordance.Start
+        } else {
+            GlassesChatAffordance.Switch
+        }
+    }
+    return when (snapshot.state) {
+        GlassesModeState.LISTENING,
+        GlassesModeState.TRANSCRIBING,
+        GlassesModeState.AWAITING_HERMES,
+        GlassesModeState.RENDERING,
+        GlassesModeState.PHONE_PRIORITY,
+        -> GlassesChatAffordance.Connected
+        GlassesModeState.STARTING -> GlassesChatAffordance.Starting
+        GlassesModeState.SUSPENDED -> GlassesChatAffordance.Suspended
+        GlassesModeState.ERROR -> GlassesChatAffordance.Error
+        GlassesModeState.INACTIVE -> GlassesChatAffordance.Start
+    }
+}
 
 internal fun acceptedSaveDestination(
     resultCode: Int,
@@ -437,7 +485,12 @@ fun ChatScreen(
             title = { Text(stringResource(R.string.glasses_title)) },
             text = {
                 Column {
-                    Text(stringResource(R.string.glasses_status, glassesMode.state.name.lowercase()))
+                    Text(
+                        stringResource(
+                            R.string.glasses_status,
+                            stringResource(glassesModeStatusResource(glassesMode.state)),
+                        ),
+                    )
                     glassesMode.detail?.takeIf { it.isNotBlank() }?.let {
                         Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
@@ -567,8 +620,36 @@ fun ChatScreen(
                 glassesActive && glassesMode.storedSessionId == state.currentSessionId
             val canStartGlasses = viewModel.canStartGlasses()
             val glassesDisabledMessage = stringResource(R.string.glasses_disabled_no_turn)
+            val glassesAffordance = glassesChatAffordance(glassesMode, state.currentSessionId)
+            val glassesStateDescription =
+                stringResource(
+                    if (glassesAffordance == GlassesChatAffordance.Switch) {
+                        R.string.glasses_action_switch
+                    } else {
+                        glassesModeStatusResource(glassesMode.state)
+                    },
+                )
+
+            IconButton(onClick = { viewModel.toggleSearch() }) {
+                Icon(
+                    imageVector =
+                        if (searchState.isActive) Icons.Filled.Close else Icons.Filled.Search,
+                    contentDescription =
+                        if (searchState.isActive) {
+                            stringResource(
+                                R.string.chat_action_close_search,
+                            )
+                        } else {
+                            stringResource(R.string.chat_action_search)
+                        },
+                )
+            }
             IconButton(
                 enabled = glassesActive || canStartGlasses,
+                modifier =
+                    Modifier.semantics {
+                        stateDescription = glassesStateDescription
+                    },
                 onClick = {
                     if (glassesActive && glassesForCurrentChat) {
                         showGlassesSheet = true
@@ -590,33 +671,27 @@ fun ChatScreen(
                 },
             ) {
                 Icon(
-                    imageVector = Icons.Filled.Mic,
+                    painter = painterResource(R.drawable.ic_glasses),
                     contentDescription =
                         stringResource(
-                            when {
-                                glassesForCurrentChat -> R.string.glasses_action_manage
-                                glassesActive -> R.string.glasses_action_switch
-                                canStartGlasses -> R.string.glasses_action_start
-                                else -> R.string.glasses_disabled_no_turn
+                            when (glassesAffordance) {
+                                GlassesChatAffordance.Connected -> R.string.glasses_action_manage_connected
+                                GlassesChatAffordance.Switch -> R.string.glasses_action_switch
+                                GlassesChatAffordance.Start,
+                                GlassesChatAffordance.Starting,
+                                GlassesChatAffordance.Suspended,
+                                GlassesChatAffordance.Error,
+                                -> R.string.glasses_action_start
                             },
                         ),
-                )
-            }
-            IconButton(onClick = { viewModel.toggleSearch() }) {
-                Icon(
-                    imageVector =
-                        if (searchState.isActive) Icons.Filled.Close else Icons.Filled.Search,
-                    contentDescription =
-                        if (searchState.isActive) {
-                            stringResource(
-                                R.string.chat_action_close_search,
-                            )
+                    tint =
+                        if (glassesAffordance == GlassesChatAffordance.Connected) {
+                            LocalHermesStatusColors.current.success
                         } else {
-                            stringResource(R.string.chat_action_search)
+                            LocalContentColor.current
                         },
                 )
             }
-
             IconButton(onClick = { viewModel.createNewSession() }) {
                 Icon(
                     imageVector = Icons.Filled.Add,
@@ -644,25 +719,6 @@ fun ChatScreen(
                     onFix = { NavigationController.navigateTo(com.m57.hermescontrol.ProvidersScreen) },
                     onDismiss = { HermesWsClient.clearCredentialWarning() },
                 )
-            }
-
-            // Issue #890: launch update check — non-blocking banner when a
-            // newer release exists. "Update" jumps to the About-tab install
-            // flow; "Later" dismisses for the session (it returns next launch
-            // via the persisted latest tag). Release-only builds
-            // (UpdateNoticeManager.enabled = !BuildConfig.DEBUG).
-            val updateNotice by AppUpdateCache.state.collectAsStateWithLifecycle()
-            if (UpdateNoticeManager.enabled && !AppUpdateCache.dismissed) {
-                val noticeTag =
-                    (updateNotice as? AppUpdateState.UpdateAvailable)?.latestTag
-                        ?: UpdateNoticeManager.noticeTag()
-                if (noticeTag != null) {
-                    UpdateNoticeBanner(
-                        latestTag = noticeTag,
-                        onUpdate = { NavigationController.navigateTo(SettingsAbout) },
-                        onDismiss = { AppUpdateCache.dismiss() },
-                    )
-                }
             }
 
             AnimatedVisibility(

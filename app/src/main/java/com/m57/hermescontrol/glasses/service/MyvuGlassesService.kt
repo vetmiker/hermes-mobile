@@ -28,6 +28,7 @@ import com.m57.hermescontrol.glasses.myvu.MyvuTransport
 import com.m57.hermescontrol.glasses.myvu.MyvuTransportState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.filterIsInstance
@@ -50,6 +51,22 @@ internal data class MyvuGlassesStartRequest(
                 !initialDisplay.isNullOrBlank()
 }
 
+internal data class MyvuGlassesMirrorPayload(
+    val generation: Long,
+    val storedSessionId: String?,
+    val runtimeSessionId: String?,
+    val mirrorId: String?,
+    val text: String?,
+) {
+    val isValid: Boolean
+        get() =
+            generation >= 0 &&
+                !storedSessionId.isNullOrBlank() &&
+                !runtimeSessionId.isNullOrBlank() &&
+                !mirrorId.isNullOrBlank() &&
+                !text.isNullOrBlank()
+}
+
 /**
  * Owns the visible MYVU microphone session. It is only started by a foreground
  * activity after runtime permission succeeds; host traffic never starts capture.
@@ -62,6 +79,7 @@ class MyvuGlassesService : Service() {
     private var controlServer: MyvuControlServer? = null
     private var activeVoiceLease: TurnLease? = null
     private val renderer = MyvuDisplayRenderer()
+    private var sessionJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -71,6 +89,14 @@ class MyvuGlassesService : Service() {
         startId: Int,
     ): Int =
         when (intent?.action) {
+            ACTION_MIRROR_PHONE -> {
+                renderPhoneMirror(intent.toMirrorPayload())
+                START_NOT_STICKY
+            }
+            ACTION_MIRROR_RESPONSE -> {
+                renderTerminalMirror(intent.toMirrorPayload())
+                START_NOT_STICKY
+            }
             ACTION_START -> {
                 val request =
                     MyvuGlassesStartRequest(
@@ -111,11 +137,12 @@ class MyvuGlassesService : Service() {
     }
 
     private fun start(request: MyvuGlassesStartRequest) {
-        if (audioServer != null) {
-            // A different visible chat supersedes the old mode atomically:
-            // cleanup increments its generation before this new start acquires one.
+        if (sessionJob != null) {
             stopSession()
         }
+        val currentSessionJob = SupervisorJob(serviceScope.coroutineContext[Job])
+        sessionJob = currentSessionJob
+        val sessionScope = CoroutineScope(currentSessionJob + Dispatchers.Main.immediate)
         val token = checkNotNull(request.token)
         val storedSessionId = checkNotNull(request.storedSessionId)
         val runtimeSessionId = checkNotNull(request.runtimeSessionId)
@@ -148,7 +175,7 @@ class MyvuGlassesService : Service() {
                     if (acceptance.accepted && fence != null) {
                         pcmCapture?.close()
                         pcmCapture = null
-                        serviceScope.launch {
+                        sessionScope.launch {
                             val controller = GlassesModeControllerProvider.controller
                             if (!controller.isTranscriptFenceActive(fence)) return@launch
                             val coordinator = ChatTurnCoordinatorProvider.get()
@@ -173,7 +200,7 @@ class MyvuGlassesService : Service() {
                     acceptance
                 },
                 transcriptEnded = {
-                    serviceScope.launch {
+                    sessionScope.launch {
                         stopSession()
                         stopSelf()
                     }
@@ -201,7 +228,7 @@ class MyvuGlassesService : Service() {
             MyvuAudioServer(
                 token = token,
                 onClientReady = {
-                    serviceScope.launch {
+                    sessionScope.launch {
                         val snapshot = GlassesModeControllerProvider.controller.snapshot.value
                         if (
                             snapshot.state == GlassesModeState.SUSPENDED &&
@@ -216,7 +243,7 @@ class MyvuGlassesService : Service() {
                     }
                 },
                 onTransportFailure = { failure ->
-                    serviceScope.launch {
+                    sessionScope.launch {
                         pcmCapture?.close()
                         pcmCapture = null
                         GlassesModeControllerProvider
@@ -248,7 +275,7 @@ class MyvuGlassesService : Service() {
             stopSelf()
             return
         }
-        serviceScope.launch {
+        sessionScope.launch {
             val ready =
                 withTimeoutOrNull(READY_TIMEOUT_MILLIS) {
                     currentTransport.state.filterIsInstance<MyvuTransportState.Ready>().first()
@@ -290,7 +317,7 @@ class MyvuGlassesService : Service() {
             }
             pcmCapture = capture
             Log.i(TAG, "MYVU_SERVICE capture started protocol=raw-pcm16 sampleRate=16000")
-            serviceScope.launch {
+            sessionScope.launch {
                 HermesWsClient.events.collect { event ->
                     if (event !is WsEvent.MessageComplete) return@collect
                     val current = GlassesModeControllerProvider.controller.snapshot.value
@@ -323,15 +350,19 @@ class MyvuGlassesService : Service() {
                     }
                 }
             }
-            serviceScope.launch {
+            sessionScope.launch {
                 GlassesModeControllerProvider.controller.snapshot.collect { snapshot ->
-                    if (snapshot.state == GlassesModeState.PHONE_PRIORITY) {
-                        pcmCapture?.close()
-                        pcmCapture = null
+                    when (snapshot.state) {
+                        GlassesModeState.PHONE_PRIORITY -> {
+                            pcmCapture?.close()
+                            pcmCapture = null
+                        }
+                        GlassesModeState.LISTENING -> resumeCapture()
+                        else -> Unit
                     }
                 }
             }
-            serviceScope.launch {
+            sessionScope.launch {
                 currentTransport.state.collect { state ->
                     if (
                         transport === currentTransport &&
@@ -346,7 +377,57 @@ class MyvuGlassesService : Service() {
         }
     }
 
+    private fun Intent.toMirrorPayload(): MyvuGlassesMirrorPayload =
+        MyvuGlassesMirrorPayload(
+            generation = getLongExtra(EXTRA_GENERATION, -1),
+            storedSessionId = getStringExtra(EXTRA_STORED_SESSION_ID),
+            runtimeSessionId = getStringExtra(EXTRA_RUNTIME_SESSION_ID),
+            mirrorId = getStringExtra(EXTRA_MIRROR_ID),
+            text = getStringExtra(EXTRA_DISPLAY_TEXT),
+        )
+
+    private fun renderPhoneMirror(payload: MyvuGlassesMirrorPayload) {
+        if (!payload.isValid) return
+        val storedSessionId = checkNotNull(payload.storedSessionId)
+        val runtimeSessionId = checkNotNull(payload.runtimeSessionId)
+        val mirrorId = checkNotNull(payload.mirrorId)
+        val text = checkNotNull(payload.text)
+        if (
+            GlassesModeControllerProvider.controller.acceptPhoneMirror(
+                payload.generation,
+                storedSessionId,
+                runtimeSessionId,
+                mirrorId,
+            )
+        ) {
+            render(text, DisplayKind.Input)
+        }
+    }
+
+    private fun renderTerminalMirror(payload: MyvuGlassesMirrorPayload) {
+        if (!payload.isValid) return
+        val storedSessionId = checkNotNull(payload.storedSessionId)
+        val runtimeSessionId = checkNotNull(payload.runtimeSessionId)
+        val text = checkNotNull(payload.text)
+        val controller = GlassesModeControllerProvider.controller
+        if (
+            controller.acceptTerminal(
+                payload.generation,
+                storedSessionId,
+                runtimeSessionId,
+                text,
+            )
+        ) {
+            render(text, DisplayKind.Response)
+            if (controller.displayCompleted(payload.generation, storedSessionId, runtimeSessionId)) {
+                resumeCapture()
+            }
+        }
+    }
+
     private fun stopSession() {
+        sessionJob?.cancel()
+        sessionJob = null
         val hadSession = pcmCapture != null || audioServer != null || transport != null
         pcmCapture?.close()
         pcmCapture = null
@@ -430,10 +511,15 @@ class MyvuGlassesService : Service() {
     companion object {
         const val ACTION_START = "com.m57.hermescontrol.glasses.action.START"
         const val ACTION_STOP = "com.m57.hermescontrol.glasses.action.STOP"
+        internal const val ACTION_MIRROR_PHONE = "com.m57.hermescontrol.glasses.action.MIRROR_PHONE"
+        internal const val ACTION_MIRROR_RESPONSE = "com.m57.hermescontrol.glasses.action.MIRROR_RESPONSE"
         const val EXTRA_AUDIO_TOKEN = "com.m57.hermescontrol.glasses.extra.AUDIO_TOKEN"
         const val EXTRA_STORED_SESSION_ID = "com.m57.hermescontrol.glasses.extra.STORED_SESSION_ID"
         const val EXTRA_RUNTIME_SESSION_ID = "com.m57.hermescontrol.glasses.extra.RUNTIME_SESSION_ID"
         const val EXTRA_INITIAL_DISPLAY = "com.m57.hermescontrol.glasses.extra.INITIAL_DISPLAY"
+        internal const val EXTRA_GENERATION = "com.m57.hermescontrol.glasses.extra.GENERATION"
+        internal const val EXTRA_MIRROR_ID = "com.m57.hermescontrol.glasses.extra.MIRROR_ID"
+        internal const val EXTRA_DISPLAY_TEXT = "com.m57.hermescontrol.glasses.extra.DISPLAY_TEXT"
         const val DEFAULT_AUDIO_TOKEN = BuildConfig.MYVU_BRIDGE_TOKEN
         private const val CHANNEL_ID = "myvu_audio"
         private const val NOTIFICATION_ID = 8932

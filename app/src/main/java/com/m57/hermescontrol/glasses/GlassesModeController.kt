@@ -26,6 +26,7 @@ data class GlassesModeSnapshot(
     val pendingUtteranceId: String? = null,
     val inFlightTurnId: String? = null,
     val lastTerminalKey: String? = null,
+    val lastPhoneMirrorId: String? = null,
     val detail: String? = null,
 )
 
@@ -142,6 +143,43 @@ class GlassesModeController {
                 pendingUtteranceId = null,
                 inFlightTurnId = null,
             )
+        return true
+    }
+
+    @Synchronized
+    fun acceptPhoneMirror(
+        generation: Long,
+        storedSessionId: String,
+        runtimeSessionId: String,
+        mirrorId: String,
+    ): Boolean {
+        val current = _snapshot.value
+        if (
+            mirrorId.isBlank() ||
+            !current.matches(generation, storedSessionId, runtimeSessionId) ||
+            current.state != GlassesModeState.PHONE_PRIORITY ||
+            current.lastPhoneMirrorId == mirrorId
+        ) {
+            return false
+        }
+        _snapshot.value = current.copy(lastPhoneMirrorId = mirrorId)
+        return true
+    }
+
+    @Synchronized
+    fun recoverPhonePriority(
+        generation: Long,
+        storedSessionId: String,
+        runtimeSessionId: String,
+    ): Boolean {
+        val current = _snapshot.value
+        if (
+            !current.matches(generation, storedSessionId, runtimeSessionId) ||
+            current.state != GlassesModeState.PHONE_PRIORITY
+        ) {
+            return false
+        }
+        _snapshot.value = current.openListeningEpoch()
         return true
     }
 

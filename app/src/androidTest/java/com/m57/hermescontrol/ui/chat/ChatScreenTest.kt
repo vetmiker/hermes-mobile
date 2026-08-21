@@ -3,6 +3,7 @@ package com.m57.hermescontrol.ui.chat
 import android.content.pm.PackageManager
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performTextInput
 import androidx.core.content.ContextCompat
@@ -51,18 +52,7 @@ class ChatScreenTest {
         // Default ChatUiState has connectionStatus=DISCONNECTED which
         // disables the input field and hides the send button.  Override
         // so the interactive controls are active.
-        val uiState =
-            ChatUiState(
-                connectionStatus = ConnectionStatus.CONNECTED,
-            )
-        val mockViewModel = mockk<ChatViewModel>(relaxed = true)
-        every { mockViewModel.uiState } returns MutableStateFlow(uiState).asStateFlow()
-        every { mockViewModel.streamingState } returns MutableStateFlow(StreamingState()).asStateFlow()
-        // ActionProgressDialog collects the controller's StateFlow — a relaxed
-        // mock proxy would crash the cast inside collectAsStateWithLifecycle.
-        // A real controller (never started here) stays invisible.
-        every { mockViewModel.actionProgress } returns
-            ActionProgressController(scope = CoroutineScope(Dispatchers.Main))
+        val mockViewModel = connectedViewModel()
 
         composeTestRule.setContent {
             ChatScreen(
@@ -81,5 +71,28 @@ class ChatScreenTest {
         composeTestRule.onNodeWithTag("chat_input").performTextInput("Hello Hermes")
         composeTestRule.onNodeWithTag("send_button").assertIsDisplayed()
         composeTestRule.onNodeWithTag("mic_button").assertIsDisplayed()
+    }
+
+    @Test
+    fun chatScreen_places_glasses_between_search_and_new_chat() {
+        val mockViewModel = connectedViewModel()
+
+        composeTestRule.setContent {
+            ChatScreen(onOpenDrawer = {}, viewModel = mockViewModel)
+        }
+
+        composeTestRule.onNodeWithContentDescription("Search").assertIsDisplayed()
+        composeTestRule.onNodeWithContentDescription("Start glasses mode").assertIsDisplayed()
+        composeTestRule.onNodeWithContentDescription("New Chat").assertIsDisplayed()
+    }
+
+    private fun connectedViewModel(): ChatViewModel {
+        val mockViewModel = mockk<ChatViewModel>(relaxed = true)
+        every { mockViewModel.uiState } returns
+            MutableStateFlow(ChatUiState(connectionStatus = ConnectionStatus.CONNECTED)).asStateFlow()
+        every { mockViewModel.streamingState } returns MutableStateFlow(StreamingState()).asStateFlow()
+        every { mockViewModel.actionProgress } returns
+            ActionProgressController(scope = CoroutineScope(Dispatchers.Main))
+        return mockViewModel
     }
 }

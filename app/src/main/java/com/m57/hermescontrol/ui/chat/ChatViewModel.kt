@@ -39,6 +39,7 @@ import com.m57.hermescontrol.data.ws.WsMethods
 import com.m57.hermescontrol.data.ws.toJsonElement
 import com.m57.hermescontrol.glasses.ChatTurnCoordinatorProvider
 import com.m57.hermescontrol.glasses.GlassesModeControllerProvider
+import com.m57.hermescontrol.glasses.GlassesModeState
 import com.m57.hermescontrol.glasses.TurnRequest
 import com.m57.hermescontrol.glasses.TurnSource
 import com.m57.hermescontrol.glasses.service.MyvuGlassesService
@@ -65,6 +66,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 private const val TAG = "ChatViewModel"
@@ -1137,39 +1139,90 @@ class ChatViewModel(
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun handleDispatchResult(result: Any?) {
-        val map = result as? Map<*, *> ?: return
-        val type = map["type"] as? String ?: return
+    private fun handleDispatchResult(
+        result: Any?,
+        mirrorFence: GlassesMirrorFence? = null,
+        visibleCommand: String? = null,
+    ) {
+        val map =
+            result as? Map<*, *> ?: run {
+                resolveMirrorFence(mirrorFence)
+                return
+            }
+        val type =
+            map["type"] as? String ?: run {
+                resolveMirrorFence(mirrorFence)
+                return
+            }
         when (type) {
             "send" -> {
-                val message = map["message"] as? String ?: ""
+                val message = map["message"] as? String
+                if (message.isNullOrBlank()) {
+                    resolveMirrorFence(mirrorFence)
+                    return
+                }
+                mirrorFence?.let { mirrorServerBackedInput(it, visibleCommand.orEmpty()) }
                 submitPrompt(message)
             }
 
             "exec" -> {
-                val output = map["output"] as? String ?: map["message"] as? String ?: ""
+                val output = map["output"] as? String ?: map["message"] as? String
+                if (output.isNullOrBlank()) {
+                    resolveMirrorFence(mirrorFence)
+                    return
+                }
+                mirrorFence?.let { mirrorServerBackedExchange(it, visibleCommand.orEmpty(), output) }
                 addAssistantMessage(output)
             }
 
             "skill" -> {
-                val message = map["message"] as? String ?: ""
+                val message = map["message"] as? String
+                if (message.isNullOrBlank()) {
+                    resolveMirrorFence(mirrorFence)
+                    return
+                }
+                mirrorFence?.let { mirrorServerBackedInput(it, visibleCommand.orEmpty()) }
                 submitPrompt(message)
             }
 
             "plugin" -> {
-                val output = map["output"] as? String ?: ""
+                val output = map["output"] as? String
+                if (output.isNullOrBlank()) {
+                    resolveMirrorFence(mirrorFence)
+                    return
+                }
+                mirrorFence?.let { mirrorServerBackedExchange(it, visibleCommand.orEmpty(), output) }
                 addAssistantMessage(output)
             }
 
             "alias" -> {
-                val target = map["target"] as? String ?: return
-                handleSlashCommand(target)
+                val target = (map["target"] as? String)?.trim()
+                if (target.isNullOrBlank()) {
+                    resolveMirrorFence(mirrorFence)
+                    return
+                }
+                if (aliasStartsServerBackedTurn(target)) {
+                    handleSlashCommand(target, mirrorFence)
+                } else {
+                    resolveMirrorFence(mirrorFence)
+                    handleSlashCommand(target)
+                }
             }
 
             else -> {
                 val output = map["output"] as? String ?: map.toString()
+                resolveMirrorFence(mirrorFence)
                 addAssistantMessage(output)
             }
+        }
+    }
+
+    private fun aliasStartsServerBackedTurn(target: String): Boolean {
+        if (!target.trim().startsWith("/") || CommandBlocklist.contains(target)) return false
+        return when (slashDispatcher.dispatch(target)) {
+            SlashResult.RpcDispatch -> true
+            is SlashResult.QueuePrompt -> target.substringAfter(" ", "").isNotBlank()
+            else -> false
         }
     }
 
@@ -1257,6 +1310,129 @@ class ChatViewModel(
         )
     }
 
+    private fun mirrorAcceptedPhoneInput(
+        storedSessionId: String,
+        runtimeSessionId: String,
+        visibleText: String,
+    ) {
+        val snapshot = GlassesModeControllerProvider.controller.snapshot.value
+        if (
+            snapshot.state != GlassesModeState.PHONE_PRIORITY ||
+            snapshot.storedSessionId != storedSessionId ||
+            snapshot.runtimeSessionId != runtimeSessionId
+        ) {
+            return
+        }
+        mirrorGlassesDisplay(
+            action = MyvuGlassesService.ACTION_MIRROR_PHONE,
+            fence =
+                GlassesMirrorFence(
+                    generation = snapshot.generation,
+                    storedSessionId = storedSessionId,
+                    runtimeSessionId = runtimeSessionId,
+                    mirrorId = UUID.randomUUID().toString(),
+                ),
+            text = visibleText,
+        )
+    }
+
+    private fun recoverPhonePriority(
+        storedSessionId: String,
+        runtimeSessionId: String,
+    ) {
+        val snapshot = GlassesModeControllerProvider.controller.snapshot.value
+        GlassesModeControllerProvider.controller.recoverPhonePriority(
+            snapshot.generation,
+            storedSessionId,
+            runtimeSessionId,
+        )
+    }
+
+    private fun resolveMirrorFence(fence: GlassesMirrorFence?) {
+        fence ?: return
+        GlassesModeControllerProvider.controller.recoverPhonePriority(
+            fence.generation,
+            fence.storedSessionId,
+            fence.runtimeSessionId,
+        )
+    }
+
+    private data class GlassesMirrorFence(
+        val generation: Long,
+        val storedSessionId: String,
+        val runtimeSessionId: String,
+        val mirrorId: String,
+    )
+
+    private fun claimServerBackedMirror(
+        storedSessionId: String,
+        runtimeSessionId: String,
+    ): GlassesMirrorFence? {
+        val controller = GlassesModeControllerProvider.controller
+        if (!controller.claimPhonePriority(storedSessionId, runtimeSessionId)) return null
+        val snapshot = controller.snapshot.value
+        if (
+            snapshot.storedSessionId != storedSessionId ||
+            snapshot.runtimeSessionId != runtimeSessionId
+        ) {
+            return null
+        }
+        return GlassesMirrorFence(
+            generation = snapshot.generation,
+            storedSessionId = storedSessionId,
+            runtimeSessionId = runtimeSessionId,
+            mirrorId = UUID.randomUUID().toString(),
+        )
+    }
+
+    private fun mirrorServerBackedExchange(
+        fence: GlassesMirrorFence,
+        visibleText: String,
+        terminalText: String,
+    ) {
+        mirrorServerBackedInput(fence, visibleText)
+        mirrorServerBackedResponse(fence, terminalText)
+    }
+
+    private fun mirrorGlassesDisplay(
+        action: String,
+        fence: GlassesMirrorFence,
+        text: String,
+    ) {
+        val application = getApplication<Application>()
+        application.startService(
+            Intent(application, MyvuGlassesService::class.java)
+                .setAction(action)
+                .putExtra(MyvuGlassesService.EXTRA_GENERATION, fence.generation)
+                .putExtra(MyvuGlassesService.EXTRA_STORED_SESSION_ID, fence.storedSessionId)
+                .putExtra(MyvuGlassesService.EXTRA_RUNTIME_SESSION_ID, fence.runtimeSessionId)
+                .putExtra(MyvuGlassesService.EXTRA_MIRROR_ID, fence.mirrorId)
+                .putExtra(MyvuGlassesService.EXTRA_DISPLAY_TEXT, text),
+        )
+    }
+
+    private fun mirrorServerBackedInput(
+        fence: GlassesMirrorFence,
+        visibleText: String,
+    ) {
+        mirrorGlassesDisplay(
+            action = MyvuGlassesService.ACTION_MIRROR_PHONE,
+            fence = fence,
+            text = visibleText,
+        )
+    }
+
+    private fun mirrorServerBackedResponse(
+        fence: GlassesMirrorFence,
+        terminalText: String,
+    ) {
+        mirrorGlassesDisplay(
+            action = MyvuGlassesService.ACTION_MIRROR_RESPONSE,
+            fence = fence,
+            text = terminalText,
+        )
+    }
+
     // ── Send message ─────────────────────────────────────────────────────
 
     /**
@@ -1314,15 +1490,29 @@ class ChatViewModel(
                 val coordinator = ChatTurnCoordinatorProvider.get()
                 coordinator.claimPhonePriority(storageSessionId, agentSessionId)
                 GlassesModeControllerProvider.controller.claimPhonePriority(storageSessionId, agentSessionId)
-                coordinator.submit(
-                    TurnRequest(
-                        storedSessionId = storageSessionId,
-                        runtimeSessionId = agentSessionId,
-                        text = text,
-                        source = TurnSource.PHONE,
-                        isStreaming = wasStreaming,
-                    ),
-                )
+                try {
+                    val outcome =
+                        coordinator.submit(
+                            TurnRequest(
+                                storedSessionId = storageSessionId,
+                                runtimeSessionId = agentSessionId,
+                                text = text,
+                                source = TurnSource.PHONE,
+                                isStreaming = wasStreaming,
+                            ),
+                        )
+                    if (outcome.accepted) {
+                        mirrorAcceptedPhoneInput(storageSessionId, agentSessionId, text)
+                    } else {
+                        recoverPhonePriority(storageSessionId, agentSessionId)
+                        _uiState.update {
+                            it.copy(errorMessage = "Another chat turn is still completing")
+                        }
+                    }
+                } catch (error: Exception) {
+                    recoverPhonePriority(storageSessionId, agentSessionId)
+                    _uiState.update { it.copy(errorMessage = "Failed to send message: ${error.message}") }
+                }
             }
             return
         }
@@ -1406,20 +1596,28 @@ class ChatViewModel(
                         if (text.isNotBlank()) "\n\n$text" else ""
                 }
 
-            val outcome =
-                coordinator.submit(
-                    TurnRequest(
-                        storedSessionId = storageSessionId,
-                        runtimeSessionId = agentSessionId,
-                        text = fullText,
-                        source = TurnSource.PHONE,
-                        isStreaming = wasStreaming,
-                    ),
-                )
-            if (!outcome.accepted) {
-                _uiState.update {
-                    it.copy(errorMessage = "Another chat turn is still completing")
+            try {
+                val outcome =
+                    coordinator.submit(
+                        TurnRequest(
+                            storedSessionId = storageSessionId,
+                            runtimeSessionId = agentSessionId,
+                            text = fullText,
+                            source = TurnSource.PHONE,
+                            isStreaming = wasStreaming,
+                        ),
+                    )
+                if (outcome.accepted) {
+                    mirrorAcceptedPhoneInput(storageSessionId, agentSessionId, text)
+                } else {
+                    recoverPhonePriority(storageSessionId, agentSessionId)
+                    _uiState.update {
+                        it.copy(errorMessage = "Another chat turn is still completing")
+                    }
                 }
+            } catch (error: Exception) {
+                recoverPhonePriority(storageSessionId, agentSessionId)
+                _uiState.update { it.copy(errorMessage = "Failed to send message: ${error.message}") }
             }
         }
     }
@@ -1478,7 +1676,10 @@ class ChatViewModel(
 
     fun clearAttachments() = attachmentsDelegate.clearAttachments()
 
-    private fun handleSlashCommand(command: String) {
+    private fun handleSlashCommand(
+        command: String,
+        mirrorFence: GlassesMirrorFence? = null,
+    ) {
         // Classify FIRST (pure logic) — /queue's optimistic bubble must show
         // the queued TEXT (prefix stripped, see QueuePrompt.displayContent) so
         // it matches the server echo and the transcript sync dedupes instead
@@ -1547,11 +1748,11 @@ class ChatViewModel(
             }
 
             is SlashResult.QueuePrompt -> {
-                handleQueueCommand(command)
+                handleQueueCommand(command, mirrorFence)
             }
 
             is SlashResult.RpcDispatch -> {
-                dispatchViaRpc(command)
+                dispatchViaRpc(command, mirrorFence)
             }
         }
     }
@@ -1565,12 +1766,17 @@ class ChatViewModel(
      * `command.dispatch` `queue` shim only echoes the text back as a plain
      * submit, which loses the queued flag and hijacks the live turn.
      */
-    private fun handleQueueCommand(command: String) {
+    private fun handleQueueCommand(
+        command: String,
+        mirrorFence: GlassesMirrorFence? = null,
+    ) {
         val arg = command.split(" ", limit = 2).getOrElse(1) { "" }.trim()
         if (arg.isBlank()) {
+            resolveMirrorFence(mirrorFence)
             addAssistantMessage("usage: /queue <prompt>")
             return
         }
+        mirrorFence?.let { mirrorServerBackedInput(it, arg) }
         submitPrompt(arg, queued = true)
     }
 
@@ -1642,9 +1848,14 @@ class ChatViewModel(
         }
     }
 
-    private fun dispatchViaRpc(command: String) {
+    private fun dispatchViaRpc(
+        command: String,
+        inheritedMirrorFence: GlassesMirrorFence? = null,
+    ) {
         val sessionId = runtimeSessionId
-        if (sessionId == null) {
+        val storedSessionId = _uiState.value.currentSessionId
+        if (sessionId == null || storedSessionId == null) {
+            resolveMirrorFence(inheritedMirrorFence)
             addAssistantMessage("No active session. Use `/new` to create one.")
             return
         }
@@ -1652,7 +1863,10 @@ class ChatViewModel(
         val name = parts[0].lowercase().removePrefix("/")
         val arg = parts.getOrElse(1) { "" }
         viewModelScope.launch(ioDispatcher) {
+            val mirrorFence = inheritedMirrorFence ?: claimServerBackedMirror(storedSessionId, sessionId)
             try {
+                ChatTurnCoordinatorProvider.initialize(getApplication<Application>())
+                ChatTurnCoordinatorProvider.get().claimPhonePriority(storedSessionId, sessionId)
                 // Primary path: command.dispatch handles quick/plugin/bundle/
                 // skill commands + a few hardcoded ones. It returns a hard 4018
                 // "not a ... command" for everything that lives only in the TUI
@@ -1665,7 +1879,7 @@ class ChatViewModel(
                             WsMethods.COMMAND_DISPATCH,
                             mapOf("name" to name, "arg" to arg, "session_id" to sessionId),
                         ).await()
-                handleDispatchResult(result)
+                handleDispatchResult(result, mirrorFence, command)
             } catch (e: HermesWsClient.HermesRpcException) {
                 val msg = e.message.orEmpty()
                 // Registry miss on command.dispatch: the backend emits exactly
@@ -1686,14 +1900,26 @@ class ChatViewModel(
                                     ),
                                 ).await()
                         val output = (result as? Map<*, *>)?.get("output") as? String
-                        if (!output.isNullOrBlank()) addAssistantMessage(output)
+                        if (!output.isNullOrBlank()) {
+                            mirrorFence?.let {
+                                mirrorServerBackedInput(it, command)
+                                mirrorServerBackedResponse(it, output)
+                            }
+                            addAssistantMessage(output)
+                        } else {
+                            resolveMirrorFence(mirrorFence)
+                        }
                     } catch (e2: HermesWsClient.HermesRpcException) {
+                        resolveMirrorFence(mirrorFence)
                         addAssistantMessage("⚠️ /$name: ${e2.message}")
                     }
                 } else {
-                    // Legit error from command.dispatch (busy, no history, etc.)
+                    resolveMirrorFence(mirrorFence)
                     addAssistantMessage("⚠️ /$name: ${e.message}")
                 }
+            } catch (error: Exception) {
+                resolveMirrorFence(mirrorFence)
+                _uiState.update { it.copy(errorMessage = "Failed to run /$name: ${error.message}") }
             }
         }
     }

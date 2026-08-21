@@ -17,7 +17,6 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -130,7 +129,6 @@ class UpdateNoticeManagerTest {
             advanceUntilIdle()
 
             assertEquals(AppUpdateState.Idle, AppUpdateCache.state.value)
-            assertFalse(AppUpdateCache.dismissed)
         }
 
     // ── noticeTag (dismissed/restart banner return) ─────────────────────
