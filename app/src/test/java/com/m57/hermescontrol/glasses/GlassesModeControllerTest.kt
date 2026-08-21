@@ -174,6 +174,20 @@ class GlassesModeControllerTest {
         assertTrue(controller.snapshot.value.activeStreamId != null)
     }
 
+    @Test
+    fun phone_mirror_acceptance_requires_the_current_phone_priority_fence_and_deduplicates_id() {
+        val controller = GlassesModeController()
+        val started = startListening(controller, "stored", "runtime")
+
+        assertFalse(controller.acceptPhoneMirror(started.generation, "stored", "runtime", "mirror-1"))
+        assertTrue(controller.claimPhonePriority("stored", "runtime"))
+        assertTrue(controller.acceptPhoneMirror(started.generation, "stored", "runtime", "mirror-1"))
+        assertFalse(controller.acceptPhoneMirror(started.generation, "stored", "runtime", "mirror-1"))
+        assertFalse(controller.acceptPhoneMirror(started.generation - 1, "stored", "runtime", "mirror-2"))
+        assertTrue(controller.recoverPhonePriority(started.generation, "stored", "runtime"))
+        assertEquals(GlassesModeState.LISTENING, controller.snapshot.value.state)
+    }
+
     private fun startListening(
         controller: GlassesModeController,
         storedSessionId: String,

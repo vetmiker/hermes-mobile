@@ -2,6 +2,7 @@ package com.m57.hermescontrol.glasses.myvu
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
@@ -13,6 +14,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -47,13 +49,58 @@ object MyvuDiagnosticGate {
     }
 }
 
+interface MyvuDiagnosticTransport {
+    val state: StateFlow<MyvuTransportState>
+
+    fun bind(): Boolean
+
+    fun send(command: MyvuDisplayCommand): Result<String?>
+
+    fun unbind()
+}
+
+object MyvuDiagnosticTransportFactory {
+    private val stockFactory: (Context) -> MyvuDiagnosticTransport = { context ->
+        StockMyvuDiagnosticTransport(context)
+    }
+
+    @Volatile
+    private var factory: (Context) -> MyvuDiagnosticTransport = stockFactory
+
+    fun create(context: Context): MyvuDiagnosticTransport = factory(context)
+
+    fun installForTesting(factory: () -> MyvuDiagnosticTransport) {
+        this.factory = { factory() }
+    }
+
+    fun resetForTesting() {
+        factory = stockFactory
+    }
+}
+
+private class StockMyvuDiagnosticTransport(
+    context: Context,
+) : MyvuDiagnosticTransport {
+    private val transport = MyvuTransport(context)
+
+    override val state: StateFlow<MyvuTransportState> = transport.state
+
+    override fun bind(): Boolean = transport.bind()
+
+    override fun send(command: MyvuDisplayCommand): Result<String?> = transport.send(command)
+
+    override fun unbind() {
+        transport.unbind()
+    }
+}
+
 /**
  * USB-only U2 gate. This component is compiled into debug builds only and is
  * unexported, so neither a host nor another app can start MYVU transport.
  */
 class MyvuDiagnosticActivity : Activity() {
     private val diagnosticScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private lateinit var transport: MyvuTransport
+    private lateinit var transport: MyvuDiagnosticTransport
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -81,7 +128,7 @@ class MyvuDiagnosticActivity : Activity() {
             return
         }
 
-        transport = MyvuTransport(this)
+        transport = MyvuDiagnosticTransportFactory.create(this)
         if (!transport.bind()) {
             MyvuDiagnosticGate.failed("Stock MYVU bind request was rejected")
             Log.e(TAG, "Stock MYVU bind request was rejected")

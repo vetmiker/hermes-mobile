@@ -996,9 +996,6 @@
     <string name="action_done">Done</string>
     <string name="action_close">Close</string>
 
-    <!-- Update notice banner (issue #890) -->
-    <string name="update_notice_banner_text">Hermes Mobile %1$s is available</string>
-    <string name="update_notice_banner_action">Update</string>
 
     <!-- Processes Screen (issue #532) -->
     <string name="processes_empty_title">No running processes</string>
@@ -1185,6 +1182,12 @@
     <string name="glasses_action_end">End glasses mode</string>
     <string name="glasses_status">Status: %1$s</string>
     <string name="glasses_action_switch">Switch glasses mode to this chat</string>
+    <string name="glasses_action_manage_connected">Manage glasses mode, connected</string>
+    <string name="glasses_status_connected">Connected</string>
+    <string name="glasses_status_starting">Starting</string>
+    <string name="glasses_status_suspended">Suspended</string>
+    <string name="glasses_status_error">Error</string>
+    <string name="glasses_status_inactive">Inactive</string>
     <string name="glasses_font_label">Font size</string>
     <string name="glasses_font_standard">Standard</string>
     <string name="glasses_font_standard_selected">Standard (selected)</string>

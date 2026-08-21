@@ -21,6 +21,9 @@ import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.JsonRpcError
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
+import com.m57.hermescontrol.glasses.GlassesModeControllerProvider
+import com.m57.hermescontrol.glasses.GlassesModeState
+import com.m57.hermescontrol.glasses.service.MyvuGlassesService
 import com.m57.hermescontrol.ui.chat.fakes.FakeChatPersistenceRepository
 import com.m57.hermescontrol.ui.chat.fakes.FakeSlashUsageStore
 import io.mockk.*
@@ -202,12 +205,14 @@ class ChatViewModelTest {
                         ),
                 ),
             )
+        GlassesModeControllerProvider.controller.end()
     }
 
     @After
     fun tearDown() {
         Dispatchers.resetMain()
         unmockkAll()
+        GlassesModeControllerProvider.controller.end()
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -249,6 +254,169 @@ class ChatViewModelTest {
 
         return Pair(viewModel, "session-123")
     }
+
+    private fun activateGlassesForSession(
+        storedSessionId: String,
+        runtimeSessionId: String,
+    ) {
+        val controller = GlassesModeControllerProvider.controller
+        controller.end()
+        val started = controller.start(storedSessionId, runtimeSessionId)
+        assertTrue(
+            controller.initialDisplayCompleted(
+                started.generation,
+                storedSessionId,
+                runtimeSessionId,
+            ),
+        )
+    }
+
+    @Test
+    fun slashDispatch_aliasToLocalCommand_recoversGlassesPhonePriority() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            activateGlassesForSession(sessionId, sessionId)
+            every {
+                HermesWsClient.request(WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns CompletableDeferred(mapOf("type" to "alias", "target" to "/new"))
+
+            viewModel.sendMessage("/alias-local")
+            advanceUntilIdle()
+
+            assertEquals(GlassesModeState.LISTENING, GlassesModeControllerProvider.controller.snapshot.value.state)
+        }
+
+    @Test
+    fun slashDispatch_aliasToServerCommand_reusesFenceForSingleTerminalMirror() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val serviceActions = mutableListOf<String>()
+            val mirrorIds = mutableListOf<String>()
+            mockkConstructor(Intent::class)
+            every { anyConstructed<Intent>().setAction(capture(serviceActions)) } answers { self as Intent }
+            every { anyConstructed<Intent>().putExtra(any<String>(), any<Long>()) } answers { self as Intent }
+            every { anyConstructed<Intent>().putExtra(any<String>(), any<String>()) } answers { self as Intent }
+            every {
+                anyConstructed<Intent>().putExtra(
+                    MyvuGlassesService.EXTRA_MIRROR_ID,
+                    capture(mirrorIds),
+                )
+            } answers { self as Intent }
+            every { app.startService(any()) } returns null
+            activateGlassesForSession(sessionId, sessionId)
+            every {
+                HermesWsClient.request(WsMethods.COMMAND_DISPATCH, any(), any())
+            } answers {
+                when (arg<Map<String, Any>>(1)["name"]) {
+                    "alias" -> CompletableDeferred(mapOf("type" to "alias", "target" to "/help"))
+                    "help" -> CompletableDeferred(mapOf("type" to "exec", "output" to "completed"))
+                    else -> error("Unexpected command dispatch")
+                }
+            }
+
+            viewModel.sendMessage("/alias")
+            advanceUntilIdle()
+            assertTrue(viewModel.uiState.value.messages.any { it.content == "completed" })
+
+            assertEquals(
+                listOf(
+                    MyvuGlassesService.ACTION_MIRROR_PHONE,
+                    MyvuGlassesService.ACTION_MIRROR_RESPONSE,
+                ),
+                serviceActions,
+            )
+            assertEquals(1, mirrorIds.distinct().size)
+            assertEquals(
+                1,
+                viewModel.uiState.value.messages.count {
+                    it.role == MessageRole.ASSISTANT && it.content == "completed"
+                },
+            )
+        }
+
+    @Test
+    fun slashDispatch_emptySuccessfulResult_recoversGlassesPhonePriority() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            activateGlassesForSession(sessionId, sessionId)
+            every {
+                HermesWsClient.request(WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns CompletableDeferred(emptyMap<String, Any>())
+
+            viewModel.sendMessage("/empty-result")
+            advanceUntilIdle()
+
+            assertEquals(GlassesModeState.LISTENING, GlassesModeControllerProvider.controller.snapshot.value.state)
+        }
+
+    @Test
+    fun slashDispatch_aliasWithoutTarget_recoversGlassesPhonePriority() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            activateGlassesForSession(sessionId, sessionId)
+            every {
+                HermesWsClient.request(WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns CompletableDeferred(mapOf("type" to "alias"))
+
+            viewModel.sendMessage("/alias-without-target")
+            advanceUntilIdle()
+
+            assertEquals(GlassesModeState.LISTENING, GlassesModeControllerProvider.controller.snapshot.value.state)
+        }
+
+    @Test
+    fun slashDispatch_failure_recoversGlassesPhonePriorityAndReportsError() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            activateGlassesForSession(sessionId, sessionId)
+            every {
+                HermesWsClient.request(WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns
+                CompletableDeferred<Any?>().also {
+                    it.completeExceptionally(IllegalStateException("network unavailable"))
+                }
+
+            viewModel.sendMessage("/dispatch-failure")
+            advanceUntilIdle()
+
+            assertEquals(GlassesModeState.LISTENING, GlassesModeControllerProvider.controller.snapshot.value.state)
+            assertTrue(viewModel.uiState.value.errorMessage?.contains("network unavailable") == true)
+        }
+
+    @Test
+    fun slashDispatch_terminalOutput_mirrorsOnce() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val serviceActions = mutableListOf<String>()
+            mockkConstructor(Intent::class)
+            every { anyConstructed<Intent>().setAction(capture(serviceActions)) } answers { self as Intent }
+            every { anyConstructed<Intent>().putExtra(any<String>(), any<Long>()) } answers { self as Intent }
+            every { anyConstructed<Intent>().putExtra(any<String>(), any<String>()) } answers { self as Intent }
+            every { app.startService(any()) } returns null
+            activateGlassesForSession(sessionId, sessionId)
+            every {
+                HermesWsClient.request(WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns CompletableDeferred(mapOf("type" to "exec", "output" to "completed"))
+
+            viewModel.sendMessage("/help")
+            advanceUntilIdle()
+            assertNull("dispatch error: ${viewModel.uiState.value.errorMessage}", viewModel.uiState.value.errorMessage)
+            assertTrue(viewModel.uiState.value.messages.any { it.content == "completed" })
+
+            assertEquals(
+                listOf(
+                    MyvuGlassesService.ACTION_MIRROR_PHONE,
+                    MyvuGlassesService.ACTION_MIRROR_RESPONSE,
+                ),
+                serviceActions,
+            )
+            assertEquals(
+                1,
+                viewModel.uiState.value.messages.count {
+                    it.role == MessageRole.ASSISTANT && it.content == "completed"
+                },
+            )
+        }
 
     // ── Slash command tests ──────────────────────────────────────────────────
 

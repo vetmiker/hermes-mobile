@@ -35,6 +35,17 @@ class MyvuDisplayRendererTest {
     }
 
     @Test
+    fun phone_input_reuses_active_document_and_keeps_only_visible_text() {
+        val renderer = MyvuDisplayRenderer(documentId = { "doc" })
+
+        val context = renderer.commandsFor("Context", DisplayKind.Context)
+        val input = renderer.commandsFor("Visible attachment prompt", DisplayKind.Input)
+
+        assertEquals(context[0].documentKey, input[0].documentKey)
+        assertTrue(input[1].payload.contains("Visible attachment prompt"))
+    }
+
+    @Test
     fun readabilityPolicyKeepsTextAndUsesSelectedFontAndPacing() {
         val renderer = MyvuDisplayRenderer(documentId = { "doc" })
 

@@ -6,6 +6,7 @@ import java.util.UUID
 
 enum class DisplayKind {
     Context,
+    Input,
     Response,
     Status,
 }
