@@ -113,8 +113,8 @@ class MyvuControlServer(
                             value["utteranceId"]?.jsonPrimitive?.contentOrNull.orEmpty(),
                             value["text"]?.jsonPrimitive?.contentOrNull.orEmpty(),
                         )
-                    if (acceptance.ended) transcriptEnded()
                     output.respond(if (acceptance.accepted || acceptance.ended) 202 else 409)
+                    if (acceptance.ended) transcriptEnded()
                 }
                 "POST" to "/control" -> {
                     val action =

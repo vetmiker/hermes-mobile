@@ -5,6 +5,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.net.Socket
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class MyvuControlServerTest {
@@ -23,6 +25,8 @@ class MyvuControlServerTest {
                     " End   Glasses Mode ",
                 ),
             )
+
+            assertTrue(harness.cleanupScheduled.await(1, TimeUnit.SECONDS))
 
             assertEquals(0, harness.reservations.get())
             assertEquals(0, harness.commits.get())
@@ -100,6 +104,7 @@ class MyvuControlServerTest {
         val reservations = AtomicInteger()
         val commits = AtomicInteger()
         val cleanupSchedules = AtomicInteger()
+        val cleanupScheduled = CountDownLatch(1)
         private val listening = controller.start("stored", "runtime")
         val listeningGeneration = listening.generation
         val listeningStreamId: String
@@ -119,7 +124,10 @@ class MyvuControlServerTest {
                             }
                         }
                 },
-                transcriptEnded = { cleanupSchedules.incrementAndGet() },
+                transcriptEnded = {
+                    cleanupSchedules.incrementAndGet()
+                    cleanupScheduled.countDown()
+                },
                 control = { false },
                 listenPort = 0,
                 readTimeoutMillis = readTimeoutMillis,
