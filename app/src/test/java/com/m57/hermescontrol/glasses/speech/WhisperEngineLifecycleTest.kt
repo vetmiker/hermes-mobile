@@ -1,5 +1,6 @@
 package com.m57.hermescontrol.glasses.speech
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -28,6 +29,30 @@ class WhisperEngineLifecycleTest {
     }
 
     @Test
+    fun cancellation_fences_vad_queued_behind_open() {
+        val native = BlockingOpenNative()
+        val engine = WhisperEngine(native = native)
+        val opened = CountDownLatch(1)
+        val completed = CountDownLatch(1)
+        var result: Result<WhisperNative.VadResult>? = null
+
+        engine.open(WhisperModelStore.ReadyModels("whisper", "vad")) { opened.countDown() }
+        assertTrue(native.openStarted.await(2, TimeUnit.SECONDS))
+        engine.vad(byteArrayOf(0, 0)) {
+            result = it
+            completed.countDown()
+        }
+        engine.cancel()
+        native.releaseOpen.countDown()
+
+        assertTrue(opened.await(2, TimeUnit.SECONDS))
+        assertTrue(completed.await(2, TimeUnit.SECONDS))
+        assertTrue(result?.isFailure == true)
+        assertEquals(0, native.vadCalls)
+        engine.close()
+    }
+
+    @Test
     fun reuses_the_exact_window_float_buffer_for_steady_state_vad() {
         val native = ReusingNative()
         val engine = WhisperEngine(native = native)
@@ -41,6 +66,44 @@ class WhisperEngineLifecycleTest {
         assertTrue(completed.await(2, TimeUnit.SECONDS))
         assertSame(native.vadInputs[0], native.vadInputs[1])
         engine.close()
+    }
+
+    private class BlockingOpenNative : WhisperNativeBridge {
+        val openStarted = CountDownLatch(1)
+        val releaseOpen = CountDownLatch(1)
+        var vadCalls = 0
+
+        override fun version() = "v1.9.3"
+
+        override fun open(
+            whisperModelPath: String,
+            vadModelPath: String,
+            threads: Int,
+        ): Long {
+            openStarted.countDown()
+            check(releaseOpen.await(2, TimeUnit.SECONDS))
+            return 1L
+        }
+
+        override fun close(handle: Long) = Unit
+
+        override fun cancel(handle: Long) = Unit
+
+        override fun resetVad(handle: Long) = Unit
+
+        override fun vadProbability(
+            handle: Long,
+            samples: FloatArray,
+        ): WhisperNative.VadResult {
+            vadCalls += 1
+            return WhisperNative.VadResult(processed = false, probability = .75f)
+        }
+
+        override fun transcribe(
+            handle: Long,
+            samples: FloatArray,
+            threads: Int,
+        ) = ""
     }
 
     private class BlockingNative : WhisperNativeBridge {

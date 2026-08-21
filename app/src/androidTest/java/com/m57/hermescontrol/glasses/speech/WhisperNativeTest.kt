@@ -10,7 +10,7 @@ import org.junit.runner.RunWith
 class WhisperNativeTest {
     @Test
     fun loads_pinned_library_and_rejects_missing_models_without_creating_a_handle() {
-        assertEquals("v1.9.3", WhisperNative.version())
+        assertEquals("1.9.3", WhisperNative.version())
 
         val failure =
             runCatching {

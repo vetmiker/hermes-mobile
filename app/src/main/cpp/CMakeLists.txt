@@ -8,6 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # The app ships only the pinned CPU implementation.  Do not let CMake discover
 # a host GPU backend while configuring an Android build.
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+# The pinned whisper.cpp source is the v1.9.3 release, not a development snapshot.
+set(WHISPER_BUILD_IS_DEV OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
