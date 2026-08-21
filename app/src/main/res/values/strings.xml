@@ -181,11 +181,7 @@
     <string name="settings_about_update_checking">Checking…</string>
     <string name="settings_about_update_uptodate">Up to date (v%1$s)</string>
     <string name="settings_about_update_available">Update available: v%1$s</string>
-    <string name="settings_about_update_action">Update</string>
-    <string name="settings_about_update_downloading">Downloading %1$d%%</string>
-    <string name="settings_about_update_installing">Installing v%1$s…</string>
-    <string name="settings_about_update_allow_sources">Allow installs from this source</string>
-    <string name="settings_about_update_open_settings">Open settings</string>
+    <string name="settings_about_update_action">Open release notes</string>
     <string name="settings_about_update_retry">Retry</string>
 
     <!-- Settings list summaries (drill-down) -->
@@ -1179,4 +1175,22 @@
     <!-- system action toast templates -->
     <string name="system_action_started">%1$s started</string>
     <string name="system_action_failed">%1$s failed: %2$s</string>
+    <string name="myvu_audio_channel_name">MYVU glasses microphone</string>
+    <string name="myvu_audio_notification_title">MYVU glasses mode is listening</string>
+    <string name="myvu_audio_notification_text">Streaming glasses microphone audio to Hermes.</string>
+    <string name="glasses_action_start">Start glasses mode</string>
+    <string name="glasses_action_manage">Manage glasses mode</string>
+    <string name="glasses_title">MYVU glasses</string>
+    <string name="glasses_disabled_no_turn">Finish one assistant reply before starting glasses mode.</string>
+    <string name="glasses_action_end">End glasses mode</string>
+    <string name="glasses_status">Status: %1$s</string>
+    <string name="glasses_action_switch">Switch glasses mode to this chat</string>
+    <string name="glasses_font_label">Font size</string>
+    <string name="glasses_font_standard">Standard</string>
+    <string name="glasses_font_standard_selected">Standard (selected)</string>
+    <string name="glasses_font_large">Large</string>
+    <string name="glasses_font_large_selected">Large (selected)</string>
+    <string name="glasses_pacing_label">Pacing</string>
+    <string name="glasses_pacing">%1$d ms</string>
+    <string name="glasses_pacing_selected">%1$d ms (selected)</string>
 </resources>

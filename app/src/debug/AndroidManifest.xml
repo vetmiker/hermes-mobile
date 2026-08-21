@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Debug-only visible U3 hardware gate. It starts capture only after
+             its own foreground permission callback; release has no entry. -->
+        <activity
+            android:name=".glasses.myvu.MyvuDiagnosticActivity"
+            android:exported="true" />
+    </application>
+</manifest>

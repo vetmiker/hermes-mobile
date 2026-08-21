@@ -4,7 +4,6 @@ import android.app.Application
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
-import androidx.core.content.FileProvider
 import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.update.AppUpdateCache
 import com.m57.hermescontrol.data.update.AppUpdateChecker
@@ -48,18 +47,11 @@ class AppUpdateViewModelTest {
 
     private fun updateInfo(
         tag: String = "v1.22.0",
-        apkName: String = "hermes-mobile-v1.22.0.apk",
+        releaseUrl: String = "https://github.com/Hy4ri/hermes-mobile/releases/tag/v1.22.0",
     ): UpdateInfo =
         UpdateInfo(
             tagName = tag,
-            assets =
-                listOf(
-                    UpdateInfo.Asset(
-                        name = apkName,
-                        size = 12345678L,
-                        browserDownloadUrl = "https://example.com/$apkName",
-                    ),
-                ),
+            htmlUrl = releaseUrl,
         )
 
     @Before
@@ -76,11 +68,9 @@ class AppUpdateViewModelTest {
         every { app.packageName } returns "com.m57.hermescontrol"
         packageManager = mockk(relaxed = true)
         every { app.packageManager } returns packageManager
-        every { packageManager.canRequestPackageInstalls() } returns true
 
         checker = mockk()
         coEvery { checker.fetchLatestRelease() } returns updateInfo()
-        coEvery { checker.downloadApk(any(), any(), any()) } returns true
     }
 
     @After
@@ -101,7 +91,10 @@ class AppUpdateViewModelTest {
 
             coVerify(exactly = 1) { checker.fetchLatestRelease() }
             assertEquals(
-                AppUpdateState.UpdateAvailable("v1.22.0", "https://example.com/hermes-mobile-v1.22.0.apk", 12345678L),
+                AppUpdateState.UpdateAvailable(
+                    "v1.22.0",
+                    "https://github.com/Hy4ri/hermes-mobile/releases/tag/v1.22.0",
+                ),
                 vm.state.value,
             )
             coVerify(exactly = 1) { AuthManager.setUpdateCheckDoneForVersion(currentVersion) }
@@ -139,8 +132,7 @@ class AppUpdateViewModelTest {
             AppUpdateCache.update(
                 AppUpdateState.UpdateAvailable(
                     latestTag = "v1.22.0",
-                    apkUrl = "https://example.com/hermes-mobile-v1.22.0.apk",
-                    sizeBytes = 12345678L,
+                    releaseNotesUrl = "https://github.com/Hy4ri/hermes-mobile/releases/tag/v1.22.0",
                 ),
             )
 
@@ -149,7 +141,10 @@ class AppUpdateViewModelTest {
 
             coVerify(exactly = 0) { checker.fetchLatestRelease() }
             assertEquals(
-                AppUpdateState.UpdateAvailable("v1.22.0", "https://example.com/hermes-mobile-v1.22.0.apk", 12345678L),
+                AppUpdateState.UpdateAvailable(
+                    "v1.22.0",
+                    "https://github.com/Hy4ri/hermes-mobile/releases/tag/v1.22.0",
+                ),
                 vm.state.value,
             )
         }
@@ -193,16 +188,20 @@ class AppUpdateViewModelTest {
         }
 
     @Test
-    fun checkForUpdate_releaseWithoutApk_surfacesError() =
+    fun checkForUpdate_releaseWithoutAssets_reportsRebaseNotice() =
         runTest {
-            coEvery { checker.fetchLatestRelease() } returns UpdateInfo(tagName = "v1.22.0")
+            coEvery {
+                checker.fetchLatestRelease()
+            } returns
+                UpdateInfo(
+                    tagName = "v1.22.0",
+                    htmlUrl = "https://github.com/Hy4ri/hermes-mobile/releases/tag/v1.22.0",
+                )
 
             val vm = createViewModel()
             advanceUntilIdle()
 
-            val state = vm.state.value
-            assertTrue(state is AppUpdateState.Error)
-            assertEquals("Release has no APK asset", (state as AppUpdateState.Error).message)
+            assertTrue(vm.state.value is AppUpdateState.UpdateAvailable)
         }
 
     @Test
@@ -216,76 +215,39 @@ class AppUpdateViewModelTest {
             coVerify(exactly = 1) { AuthManager.setUpdateCheckDoneForVersion(currentVersion) }
         }
 
-    // ── Update flow ─────────────────────────────────────────────────────
+    // ── Rebase-notice flow ───────────────────────────────────────────────
 
     @Test
-    fun startUpdate_downloadsAndLaunchesInstaller() =
+    fun openReleaseNotes_opensTheUpstreamReleaseWithoutDownloadingAnApk() =
         runTest {
             val uri = mockk<Uri>()
-            mockkStatic(FileProvider::class)
-            every { FileProvider.getUriForFile(any(), any(), any()) } returns uri
-
-            // android.content.Intent can't be constructed in a plain JVM test,
-            // so the intent factory is injected; assert the VM launches
-            // exactly the intent the factory built for the APK URI.
+            mockkStatic(Uri::class)
+            every { Uri.parse("https://github.com/Hy4ri/hermes-mobile/releases/tag/v1.22.0") } returns uri
             val intentMock = mockk<Intent>()
             val capturedIntents = mutableListOf<Intent>()
             every { app.startActivity(capture(capturedIntents)) } returns Unit
 
             val vm =
-                AppUpdateViewModel(app, checker, currentVersion, testDispatcher) { intentMock }
+                AppUpdateViewModel(app, checker, currentVersion, testDispatcher) { openedUri ->
+                    assertTrue(openedUri === uri)
+                    intentMock
+                }
             advanceUntilIdle()
-            assertTrue(vm.state.value is AppUpdateState.UpdateAvailable)
 
-            vm.startUpdate()
-            advanceUntilIdle()
+            vm.openReleaseNotes()
 
-            coVerify(exactly = 1) {
-                checker.downloadApk("https://example.com/hermes-mobile-v1.22.0.apk", any(), any())
-            }
-            assertEquals(AppUpdateState.Installing("v1.22.0"), vm.state.value)
-            assertTrue("installer must be launched", capturedIntents.isNotEmpty())
-            assertTrue("launched intent must be the factory's", capturedIntents[0] === intentMock)
-            verify { FileProvider.getUriForFile(any(), "com.m57.hermescontrol.fileprovider", any()) }
+            assertEquals(
+                AppUpdateState.UpdateAvailable(
+                    "v1.22.0",
+                    "https://github.com/Hy4ri/hermes-mobile/releases/tag/v1.22.0",
+                ),
+                vm.state.value,
+            )
+            assertTrue("release notes must open", capturedIntents.single() === intentMock)
         }
 
     @Test
-    fun startUpdate_withoutUnknownSourcesPermission_opensGate() =
-        runTest {
-            every { packageManager.canRequestPackageInstalls() } returns false
-
-            val vm = createViewModel()
-            advanceUntilIdle()
-
-            vm.startUpdate()
-            advanceUntilIdle()
-
-            assertEquals(AppUpdateState.NeedsUnknownSourcesPermission, vm.state.value)
-            coVerify(exactly = 0) { checker.downloadApk(any(), any(), any()) }
-        }
-
-    @Test
-    fun startUpdate_downloadFailure_surfacesErrorAndRetries() =
-        runTest {
-            coEvery { checker.downloadApk(any(), any(), any()) } returns false
-
-            val vm = createViewModel()
-            advanceUntilIdle()
-
-            vm.startUpdate()
-            advanceUntilIdle()
-
-            val state = vm.state.value
-            assertTrue(state is AppUpdateState.Error)
-            assertEquals("Download failed — tap to retry", (state as AppUpdateState.Error).message)
-            // Retry path: tapping the row re-runs the check, which recovers.
-            vm.checkForUpdate()
-            advanceUntilIdle()
-            assertTrue(vm.state.value is AppUpdateState.UpdateAvailable)
-        }
-
-    @Test
-    fun startUpdate_ignoredWhenStateIsNotUpdateAvailable() =
+    fun openReleaseNotes_isIgnoredWhenNoUpdateIsAvailable() =
         runTest {
             every { AuthManager.getUpdateCheckDoneForVersion() } returns currentVersion
 
@@ -293,9 +255,8 @@ class AppUpdateViewModelTest {
             advanceUntilIdle()
             assertEquals(AppUpdateState.Idle, vm.state.value)
 
-            vm.startUpdate()
-            advanceUntilIdle()
+            vm.openReleaseNotes()
 
-            coVerify(exactly = 0) { checker.downloadApk(any(), any(), any()) }
+            verify(exactly = 0) { app.startActivity(any()) }
         }
 }

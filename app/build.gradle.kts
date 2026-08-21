@@ -8,6 +8,13 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
+val myvuBridgeToken = providers.environmentVariable("MYVU_BRIDGE_TOKEN").orNull.orEmpty()
+val isReleasePackaging = gradle.startParameter.taskNames.any { taskName ->
+    taskName.contains("assembleRelease", ignoreCase = true) ||
+        taskName.contains("bundleRelease", ignoreCase = true) ||
+        taskName.contains("packageRelease", ignoreCase = true)
+}
+
 android {
     namespace = "com.m57.hermescontrol"
 
@@ -25,12 +32,28 @@ android {
         versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 1
         versionName = (project.findProperty("versionName") as? String) ?: "1.0-dev"
 
-        // Embed git commit SHA for the About card in Settings
+        // Personal releases remain install-compatible only with this signing
+        // lineage. An upstream code occupies the high digits; revisions are
+        // bounded to two digits so a newer upstream code always sorts later.
+        val upstreamVersionCode =
+            (project.findProperty("upstreamVersionCode") as? String)?.toIntOrNull() ?: 1231
+        val personalRevision =
+            (project.findProperty("personalRevision") as? String)?.toIntOrNull() ?: 1
+        require(personalRevision in 1..99) { "personalRevision must be between 1 and 99" }
+        versionCode = upstreamVersionCode * 100 + personalRevision
+        val upstreamVersionName =
+            (project.findProperty("upstreamVersionName") as? String) ?: "1.23.1"
+        versionName = "$upstreamVersionName-myvu.$personalRevision"
+
+        // Pin the downstream baseline in every build so a release record can
+        // be correlated to its exact Hy4ri source without storing secrets.
+        buildConfigField("String", "UPSTREAM_BASE_SHA", "\"59bcbdfe3c1bbc1ae2432a09303e78944a0bcbe5\"")
         val gitSha =
             providers.exec {
                 commandLine("git", "rev-parse", "--short", "HEAD")
             }.standardOutput.asText.get().trim()
         buildConfigField("String", "GIT_SHA", "\"$gitSha\"")
+        buildConfigField("String", "MYVU_BRIDGE_TOKEN", "\"$myvuBridgeToken\"")
     }
 
     signingConfigs {
@@ -77,6 +100,9 @@ android {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
         }
         release {
+            require(!isReleasePackaging || myvuBridgeToken.isNotBlank()) {
+                "MYVU_BRIDGE_TOKEN is required when packaging a release"
+            }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")

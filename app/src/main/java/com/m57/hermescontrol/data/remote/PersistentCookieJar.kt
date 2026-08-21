@@ -6,6 +6,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.HttpUrl
@@ -41,15 +42,18 @@ class PersistentCookieJar(
     private val loadedScopes = ConcurrentHashMap.newKeySet<String>()
     private val loadLatches = ConcurrentHashMap<String, CountDownLatch>()
 
-    @Volatile private var currentServerId = AtomicReference(initialServerId)
+    private val currentServerId = AtomicReference(initialServerId)
 
     private val scopeMutex = Mutex()
 
-    /** Atomically switch the active server scope and ensure its cookies are loaded. */
+    /**
+     * Atomically switch the active server scope and wait for its cookies to
+     * hydrate. The wait happens on an IO worker, never the caller thread.
+     */
     suspend fun useStore(serverId: String) {
-        scopeMutex.withLock {
-            currentServerId.set(serverId)
-            ensureLoaded(serverId)
+        currentServerId.set(serverId)
+        withContext(Dispatchers.IO) {
+            awaitLoaded(serverId)
         }
     }
 
@@ -126,6 +130,11 @@ class PersistentCookieJar(
 
     override fun loadForRequest(url: HttpUrl): List<Cookie> {
         val serverId = currentServerId.get()
+        // CookieJar is called immediately before the network request. Waiting
+        // here closes the process-start race where the app dials for a WS
+        // ticket before CookieManager's asynchronous preload has hydrated the
+        // persisted session cookie.
+        awaitLoaded(serverId)
         val hostKey = url.host
         val hosts = cache[serverId] ?: return emptyList()
         val now = System.currentTimeMillis()
@@ -148,6 +157,30 @@ class PersistentCookieJar(
                 }
             }
         }
+    }
+
+    /**
+     * Starts at most one load for a server scope. Callers that need cookies
+     * synchronously (OkHttp) wait on the latch; startup/profile code can
+     * suspend on the same work without a second store read.
+     */
+    private fun awaitLoaded(serverId: String) {
+        if (loadedScopes.contains(serverId)) return
+        val latch =
+            loadLatches.computeIfAbsent(serverId) {
+                CountDownLatch(1).also { created ->
+                    storeScope.launch {
+                        try {
+                            scopeMutex.withLock {
+                                ensureLoaded(serverId)
+                            }
+                        } finally {
+                            created.countDown()
+                        }
+                    }
+                }
+            }
+        latch.await()
     }
 
     private suspend fun ensureLoaded(serverId: String) {
@@ -195,6 +228,7 @@ class PersistentCookieJar(
         val scope = currentServerId.get()
         cache.remove(scope)
         loadedScopes.remove(scope)
+        loadLatches.remove(scope)
         storeScope.launch { store.clear(scope) }
     }
 
@@ -202,6 +236,7 @@ class PersistentCookieJar(
     fun clearAll() {
         cache.clear()
         loadedScopes.clear()
+        loadLatches.clear()
         storeScope.launch { store.clearAll() }
     }
 

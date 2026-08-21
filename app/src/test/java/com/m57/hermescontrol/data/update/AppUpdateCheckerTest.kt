@@ -57,55 +57,34 @@ class AppUpdateCheckerTest {
     // ── Release JSON parsing ────────────────────────────────────────────
 
     @Test
-    fun parseUpdateInfo_picksApkAsset() {
+    fun parseUpdateInfo_readsReleaseNotesUrlWithoutDependingOnApkAssets() {
         val json =
             """
             {
               "tag_name": "v1.22.0",
+              "html_url": "https://github.com/Hy4ri/hermes-mobile/releases/tag/v1.22.0",
               "assets": [
                 {
-                  "name": "version.txt",
-                  "size": 12,
-                  "browser_download_url": "https://github.com/Hy4ri/hermes-mobile/releases/download/v1.22.0/version.txt"
-                },
-                {
-                  "name": "hermes-mobile-v1.22.0.apk",
-                  "size": 12345678,
-                  "browser_download_url": "https://github.com/Hy4ri/hermes-mobile/releases/download/v1.22.0/hermes-mobile-v1.22.0.apk"
+                  "name": "upstream.apk",
+                  "browser_download_url": "https://example.invalid/upstream.apk"
                 }
               ]
             }
             """.trimIndent()
 
         val info = parseUpdateInfo(json)
+
         assertNotNull(info)
         assertEquals("v1.22.0", info!!.tagName)
-        val apk = info.apkAsset
-        assertNotNull("the .apk asset must be selected", apk)
-        assertEquals("hermes-mobile-v1.22.0.apk", apk!!.name)
-        assertEquals(12345678L, apk.size)
-        assertTrue(apk.browserDownloadUrl.endsWith(".apk"))
+        assertEquals("https://github.com/Hy4ri/hermes-mobile/releases/tag/v1.22.0", info.htmlUrl)
     }
 
     @Test
-    fun parseUpdateInfo_noApkAsset_yieldsNullApk() {
-        val json =
-            """
-            {
-              "tag_name": "v1.22.0",
-              "assets": [
-                {
-                  "name": "version.txt",
-                  "size": 12,
-                  "browser_download_url": "https://github.com/Hy4ri/hermes-mobile/releases/download/v1.22.0/version.txt"
-                }
-              ]
-            }
-            """.trimIndent()
+    fun parseUpdateInfo_acceptsReleaseWithoutAssets() {
+        val info = parseUpdateInfo("""{"tag_name":"v1.22.0"}""")
 
-        val info = parseUpdateInfo(json)
         assertNotNull(info)
-        assertNull(info!!.apkAsset)
+        assertEquals("", info!!.htmlUrl)
     }
 
     @Test

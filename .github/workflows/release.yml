@@ -3,11 +3,17 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "myvu-v*-r*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Release tag (e.g. v1.0.0)"
+      upstream_version:
+        description: "Pinned Hy4ri version (e.g. 1.23.1)"
+        required: true
+      upstream_code:
+        description: "Numeric upstream version code (e.g. 1231)"
+        required: true
+      personal_revision:
+        description: "Personal revision, 1-99"
         required: true
 
 concurrency:
@@ -42,23 +48,28 @@ jobs:
       - name: Grant Execute Permission for Gradlew
         run: chmod +x gradlew
 
-      - name: Determine version
+      - name: Determine personal version
         id: version
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ github.event.inputs.tag }}"
+            UPSTREAM_VERSION="${{ github.event.inputs.upstream_version }}"
+            UPSTREAM_CODE="${{ github.event.inputs.upstream_code }}"
+            PERSONAL_REVISION="${{ github.event.inputs.personal_revision }}"
           else
-            TAG="${GITHUB_REF#refs/tags/}"
+            TAG="${GITHUB_REF#refs/tags/myvu-v}"
+            UPSTREAM_VERSION="${TAG%-r*}"
+            PERSONAL_REVISION="${TAG##*-r}"
+            UPSTREAM_CODE="${UPSTREAM_VERSION//./}"
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          # Strip leading 'v' for versionName
-          VERSION="${TAG#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          # versionCode: strip dots from version, pad to keep sortable
-          CODE=$(echo "$VERSION" | tr -d '.' | sed 's/^0*//')
-          [ -z "$CODE" ] && CODE=0
-          echo "code=$CODE" >> "$GITHUB_OUTPUT"
-          echo "Release: tag=$TAG version=$VERSION code=$CODE"
+          [[ "$PERSONAL_REVISION" =~ ^[1-9][0-9]?$ ]] || { echo "Invalid personal revision"; exit 1; }
+          VERSION_NAME="${UPSTREAM_VERSION}-myvu.${PERSONAL_REVISION}"
+          VERSION_CODE=$((10#$UPSTREAM_CODE * 100 + 10#$PERSONAL_REVISION))
+          echo "upstream_version=$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "upstream_code=$UPSTREAM_CODE" >> "$GITHUB_OUTPUT"
+          echo "personal_revision=$PERSONAL_REVISION" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "Release: version=$VERSION_NAME code=$VERSION_CODE"
 
       - name: Decode release keystore
         env:
@@ -69,26 +80,25 @@ jobs:
 
       - name: Build Release APK
         env:
-          VERSION_NAME: ${{ steps.version.outputs.version }}
-          VERSION_CODE: ${{ steps.version.outputs.code }}
           KEYSTORE_PATH: ${{ github.workspace }}/hermes-mobile-release.keystore.jks
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           ./gradlew assembleRelease \
-            -PversionName="$VERSION_NAME" \
-            -PversionCode="$VERSION_CODE"
+            -PupstreamVersionName="${{ steps.version.outputs.upstream_version }}" \
+            -PupstreamVersionCode="${{ steps.version.outputs.upstream_code }}" \
+            -PpersonalRevision="${{ steps.version.outputs.personal_revision }}"
 
       - name: Rename APK and generate version file
         run: |
           mkdir -p release
           cp app/build/outputs/apk/release/app-release.apk \
-            release/hermes-mobile-${{ steps.version.outputs.tag }}.apk
-          # Write version.txt for F-Droid to extract version info
+            release/hermes-mobile-${{ steps.version.outputs.version_name }}.apk
           cat > release/version.txt <<EOF
-          versionName=${{ steps.version.outputs.version }}
-          versionCode=${{ steps.version.outputs.code }}
+          versionName=${{ steps.version.outputs.version_name }}
+          versionCode=${{ steps.version.outputs.version_code }}
+          upstreamBase=59bcbdfe3c1bbc1ae2432a09303e78944a0bcbe5
           EOF
           ls -lh release/
 
@@ -102,11 +112,11 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: Hermes Mobile ${{ steps.version.outputs.tag }}
+          tag_name: myvu-v${{ steps.version.outputs.upstream_version }}-r${{ steps.version.outputs.personal_revision }}
+          name: Hermes Mobile ${{ steps.version.outputs.version_name }}
           generate_release_notes: true
           files: |
-            release/hermes-mobile-${{ steps.version.outputs.tag }}.apk
+            release/hermes-mobile-${{ steps.version.outputs.version_name }}.apk
             release/version.txt
           prerelease: false
         env:

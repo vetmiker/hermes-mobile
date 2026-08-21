@@ -11,6 +11,9 @@ import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.session.ActiveSessionHolder
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.WsMethods
+import com.m57.hermescontrol.glasses.ChatTurnCoordinatorProvider
+import com.m57.hermescontrol.glasses.TurnRequest
+import com.m57.hermescontrol.glasses.TurnSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -77,28 +80,20 @@ open class NotificationReplyReceiver : BroadcastReceiver() {
                                 return@withContext
                             }
 
+                            ChatTurnCoordinatorProvider.initialize(context)
                             val runtimeSessionId =
                                 ActiveSessionHolder.resolveRuntimeSessionId(sessionId)
                                     ?: resumeSession(sessionId)
-                            HermesWsClient
-                                .request(
-                                    WsMethods.PROMPT_SUBMIT,
-                                    mapOf("session_id" to runtimeSessionId, "text" to replyText),
-                                    timeoutMs = REPLY_TIMEOUT_MS,
-                                ).await()
-
-                            val entity =
-                                com.m57.hermescontrol.data.local.ChatMessageEntity(
-                                    id =
-                                        java.util.UUID
-                                            .randomUUID()
-                                            .toString(),
-                                    sessionId = sessionId,
-                                    role = "USER",
-                                    content = replyText,
-                                    timestamp = System.currentTimeMillis(),
+                            ChatTurnCoordinatorProvider
+                                .get()
+                                .submit(
+                                    TurnRequest(
+                                        storedSessionId = sessionId,
+                                        runtimeSessionId = runtimeSessionId,
+                                        text = replyText,
+                                        source = TurnSource.NOTIFICATION,
+                                    ),
                                 )
-                            dao.upsert(entity)
 
                             val repliedNotification = buildReplyNotification(context)
                             val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager

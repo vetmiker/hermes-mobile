@@ -3,11 +3,10 @@ package com.m57.hermescontrol.data.update
 import com.m57.hermescontrol.data.remote.OkHttpProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.File
-import java.io.IOException
 
 /**
  * Latest release metadata from the GitHub releases API (issue #867) — the
@@ -17,19 +16,9 @@ import java.io.IOException
 @Serializable
 data class UpdateInfo(
     val tagName: String = "",
-    val assets: List<Asset> = emptyList(),
-) {
-    @Serializable
-    data class Asset(
-        val name: String = "",
-        val size: Long = 0L,
-        val browserDownloadUrl: String = "",
-    )
-
-    /** The release APK asset — release.yml ships `hermes-mobile-<tag>.apk`. */
-    val apkAsset: Asset?
-        get() = assets.firstOrNull { it.name.endsWith(".apk", ignoreCase = true) }
-}
+    @SerialName("html_url")
+    val htmlUrl: String = "",
+)
 
 /** Strip a leading 'v' from a release tag ("v1.21.0" → "1.21.0"). */
 fun normalizedVersion(tag: String): String = tag.trim().removePrefix("v")
@@ -63,10 +52,9 @@ private fun versionSegments(version: String): List<Int>? {
 }
 
 /**
- * Talks to the GitHub releases API and downloads the release APK (issue
- * #867). Network methods are `open` so tests can fake them; the pure logic
- * ([isNewerVersion], [parseUpdateInfo]) lives top-level for direct unit
- * tests.
+ * Fetches upstream release metadata for the personal fork's rebase notice.
+ * APK assets are intentionally never downloaded or installed because they
+ * are signed by a different lineage.
  */
 open class AppUpdateChecker(
     private val client: OkHttpClient = OkHttpProvider.base,
@@ -86,54 +74,9 @@ open class AppUpdateChecker(
                     .build()
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return@use null
-                val body = response.body.string().orEmpty()
-                parseUpdateInfo(body)
+                parseUpdateInfo(response.body.string().orEmpty())
             }
         }
-
-    /**
-     * Stream a release APK asset to [dest], reporting progress 0..1 via
-     * [onProgress]. True on success; false (with the partial file deleted)
-     * on any HTTP or I/O failure.
-     */
-    open suspend fun downloadApk(
-        url: String,
-        dest: File,
-        onProgress: (Float) -> Unit,
-    ): Boolean =
-        withContext(Dispatchers.IO) {
-            val request = Request.Builder().url(url).build()
-            try {
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) return@withContext false
-                    val body = response.body
-                    val total = body.contentLength()
-                    dest.outputStream().use { out ->
-                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                        var read = 0L
-                        body.byteStream().use { input ->
-                            while (true) {
-                                val n = input.read(buffer)
-                                if (n == -1) break
-                                out.write(buffer, 0, n)
-                                read += n
-                                if (total > 0) {
-                                    onProgress((read.toFloat() / total.toFloat()).coerceIn(0f, 1f))
-                                }
-                            }
-                        }
-                    }
-                    true
-                }
-            } catch (e: Exception) {
-                dest.delete()
-                false
-            }
-        }
-
-    private companion object {
-        const val DEFAULT_BUFFER_SIZE = 8192
-    }
 }
 
 /** Parse a GitHub `releases/latest` JSON body into [UpdateInfo], or null. */

@@ -36,6 +36,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -85,6 +86,10 @@ import com.m57.hermescontrol.data.update.AppUpdateState
 import com.m57.hermescontrol.data.update.UpdateNoticeManager
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
+import com.m57.hermescontrol.glasses.GlassesModeControllerProvider
+import com.m57.hermescontrol.glasses.GlassesModeState
+import com.m57.hermescontrol.glasses.myvu.GlassesFontMode
+import com.m57.hermescontrol.glasses.myvu.GlassesReadabilityStore
 import com.m57.hermescontrol.theme.LocalHermesStatusColors
 import com.m57.hermescontrol.ui.chat.components.ChatConnectionBanner
 import com.m57.hermescontrol.ui.chat.components.ChatInputBar
@@ -159,6 +164,9 @@ fun ChatScreen(
     val scrollScope = rememberCoroutineScope()
     val scrollController = rememberChatScrollController(listState, scrollScope)
     var isOlderPagingArmed by remember(state.currentSessionId) { mutableStateOf(false) }
+    val glassesMode by GlassesModeControllerProvider.controller.snapshot.collectAsStateWithLifecycle()
+    val glassesReadability by GlassesReadabilityStore.readability.collectAsStateWithLifecycle()
+    var showGlassesSheet by rememberSaveable { mutableStateOf(false) }
     var showContextSheet by remember { mutableStateOf(false) }
     var pendingSavePath by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingSaveName by rememberSaveable { mutableStateOf<String?>(null) }
@@ -289,6 +297,10 @@ fun ChatScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val isDark = isSystemInDarkTheme()
     val context = LocalContext.current
+    val glassesPermissionLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) viewModel.startGlasses(context)
+        }
 
     val micListeningPrompt = stringResource(R.string.chat_mic_listening)
     val sttNotAvailableMsg = stringResource(R.string.stt_not_available)
@@ -419,6 +431,78 @@ fun ChatScreen(
         viewModel = viewModel,
     )
 
+    if (showGlassesSheet) {
+        AlertDialog(
+            onDismissRequest = { showGlassesSheet = false },
+            title = { Text(stringResource(R.string.glasses_title)) },
+            text = {
+                Column {
+                    Text(stringResource(R.string.glasses_status, glassesMode.state.name.lowercase()))
+                    glassesMode.detail?.takeIf { it.isNotBlank() }?.let {
+                        Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Text(stringResource(R.string.glasses_font_label))
+                    Row {
+                        TextButton(onClick = { GlassesReadabilityStore.setFontMode(GlassesFontMode.Standard) }) {
+                            Text(
+                                stringResource(
+                                    if (glassesReadability.fontMode == GlassesFontMode.Standard) {
+                                        R.string.glasses_font_standard_selected
+                                    } else {
+                                        R.string.glasses_font_standard
+                                    },
+                                ),
+                            )
+                        }
+                        TextButton(onClick = { GlassesReadabilityStore.setFontMode(GlassesFontMode.Large) }) {
+                            Text(
+                                stringResource(
+                                    if (glassesReadability.fontMode == GlassesFontMode.Large) {
+                                        R.string.glasses_font_large_selected
+                                    } else {
+                                        R.string.glasses_font_large
+                                    },
+                                ),
+                            )
+                        }
+                    }
+                    Text(stringResource(R.string.glasses_pacing_label))
+                    Row {
+                        listOf(200, 300, 450).forEach { pacingMillis ->
+                            TextButton(onClick = { GlassesReadabilityStore.setPacingMillis(pacingMillis) }) {
+                                Text(
+                                    stringResource(
+                                        if (glassesReadability.pacingMillis == pacingMillis) {
+                                            R.string.glasses_pacing_selected
+                                        } else {
+                                            R.string.glasses_pacing
+                                        },
+                                        pacingMillis,
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.endGlasses(context)
+                        showGlassesSheet = false
+                    },
+                ) {
+                    Text(stringResource(R.string.glasses_action_end))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showGlassesSheet = false }) {
+                    Text(stringResource(R.string.chat_dismiss))
+                }
+            },
+        )
+    }
+
     HermesScaffold(
         modifier = modifier,
         pinTopBar = true,
@@ -478,7 +562,46 @@ fun ChatScreen(
             }
         },
         actions = {
-            // Search toggle
+            val glassesActive = glassesMode.state != GlassesModeState.INACTIVE
+            val glassesForCurrentChat =
+                glassesActive && glassesMode.storedSessionId == state.currentSessionId
+            val canStartGlasses = viewModel.canStartGlasses()
+            val glassesDisabledMessage = stringResource(R.string.glasses_disabled_no_turn)
+            IconButton(
+                enabled = glassesActive || canStartGlasses,
+                onClick = {
+                    if (glassesActive && glassesForCurrentChat) {
+                        showGlassesSheet = true
+                    } else if (ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO,
+                        ) == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        if (!viewModel.startGlasses(context)) {
+                            scrollScope.launch {
+                                snackbarHostState.showSnackbar(
+                                    glassesDisabledMessage,
+                                )
+                            }
+                        }
+                    } else {
+                        glassesPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                },
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Mic,
+                    contentDescription =
+                        stringResource(
+                            when {
+                                glassesForCurrentChat -> R.string.glasses_action_manage
+                                glassesActive -> R.string.glasses_action_switch
+                                canStartGlasses -> R.string.glasses_action_start
+                                else -> R.string.glasses_disabled_no_turn
+                            },
+                        ),
+                )
+            }
             IconButton(onClick = { viewModel.toggleSearch() }) {
                 Icon(
                     imageVector =
