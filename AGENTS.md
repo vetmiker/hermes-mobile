@@ -17,14 +17,15 @@ dashboard's REST API and WebSocket TUI Gateway (JSON-RPC 2.0) over a trusted LAN
 
 ## Build & Test Commands
 
-### ✅ Local Android SDK — if available
+### Local Android SDK
 
-If you have a local Android SDK (`ANDROID_HOME` set), these work:
+Native MYVU speech builds require Android NDK `25.2.9519653` and CMake
+`3.22.1`; Gradle installs the pinned packages when the configured SDK permits.
 
 ```bash
-./gradlew assembleDebug                     # full APK build
+./gradlew assembleDebug                     # debug APK + both native ABIs
 ./gradlew testDebugUnitTest                 # unit tests (MockK)
-./gradlew ktlintCheck                       # style check
+./gradlew externalNativeBuildRelease        # release JNI compilation
 ```
 
 **ktlint standalone** (no SDK needed):

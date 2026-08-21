@@ -32,6 +32,46 @@ class GlassesModeControllerTest {
     }
 
     @Test
+    fun endpoint_claim_requires_exact_transcribing_fence_before_commit() {
+        val controller = GlassesModeController()
+        val listening = startListening(controller, "stored", "runtime")
+        val fence =
+            checkNotNull(
+                controller.beginTranscription(
+                    listening.generation,
+                    checkNotNull(listening.activeStreamId),
+                    "utterance",
+                ),
+            )
+
+        assertEquals(GlassesModeState.TRANSCRIBING, controller.snapshot.value.state)
+        assertFalse(controller.completeTranscript(fence, " ").accepted)
+        assertEquals(GlassesModeState.LISTENING, controller.snapshot.value.state)
+        assertFalse(controller.isTranscriptFenceActive(fence))
+    }
+
+    @Test
+    fun submission_failure_releases_the_matching_awaiting_transcript_fence() {
+        val controller = GlassesModeController()
+        val listening = startListening(controller, "stored", "runtime")
+        val fence =
+            checkNotNull(
+                controller.acceptTranscript(
+                    listening.generation,
+                    checkNotNull(listening.activeStreamId),
+                    "utterance",
+                    "hello",
+                ).fence,
+            )
+
+        assertTrue(controller.failSubmission(fence, "Voice submission failed"))
+        assertEquals(GlassesModeState.SUSPENDED, controller.snapshot.value.state)
+        assertFalse(controller.isTranscriptFenceActive(fence))
+        assertNull(controller.snapshot.value.pendingUtteranceId)
+        assertNull(controller.snapshot.value.inFlightTurnId)
+    }
+
+    @Test
     fun accepted_transcript_fence_is_invalidated_by_end_or_chat_switch() {
         val controller = GlassesModeController()
         val first = startListening(controller, "stored-a", "runtime-a")

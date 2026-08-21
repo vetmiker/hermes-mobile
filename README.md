@@ -65,14 +65,16 @@
 ### Prerequisites
 
 - **JDK 21+** (required for Kotlin compilation and the Gradle toolchain)
-- **Android Studio** (Ladybug+) or a **Nix** development environment
+- **Android Studio** (Ladybug+) or a **Nix** development environment with NDK
+  `25.2.9519653` and CMake `3.22.1` for the pinned Whisper JNI build
 
 ### Build & Deploy
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/Hy4ri/hermes-mobile.git
+   git clone --recurse-submodules https://github.com/Hy4ri/hermes-mobile.git
    cd hermes-mobile
+   # Existing clones: git submodule update --init --recursive
    ```
 2. **Build the debug APK:**
    ```bash

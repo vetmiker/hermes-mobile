@@ -10,7 +10,6 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.m57.hermescontrol.BuildConfig
 import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.local.HermesDatabase
 import com.m57.hermescontrol.data.local.SlashUsageStore
@@ -1286,7 +1285,7 @@ class ChatViewModel(
                 isAgentTyping = state.isAgentTyping,
                 streamingMessage = state.streamingMessage,
             )
-        if (BuildConfig.MYVU_BRIDGE_TOKEN.isBlank() ||
+        if (
             storedSessionId.isNullOrBlank() ||
             activeRuntimeSessionId.isNullOrBlank() ||
             initialDisplay.isNullOrBlank()
@@ -1296,7 +1295,6 @@ class ChatViewModel(
         val intent =
             Intent(context, MyvuGlassesService::class.java)
                 .setAction(MyvuGlassesService.ACTION_START)
-                .putExtra(MyvuGlassesService.EXTRA_AUDIO_TOKEN, BuildConfig.MYVU_BRIDGE_TOKEN)
                 .putExtra(MyvuGlassesService.EXTRA_STORED_SESSION_ID, storedSessionId)
                 .putExtra(MyvuGlassesService.EXTRA_RUNTIME_SESSION_ID, activeRuntimeSessionId)
                 .putExtra(MyvuGlassesService.EXTRA_INITIAL_DISPLAY, initialDisplay)

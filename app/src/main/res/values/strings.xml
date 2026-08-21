@@ -1173,8 +1173,11 @@
     <string name="system_action_started">%1$s started</string>
     <string name="system_action_failed">%1$s failed: %2$s</string>
     <string name="myvu_audio_channel_name">MYVU glasses microphone</string>
-    <string name="myvu_audio_notification_title">MYVU glasses mode is listening</string>
-    <string name="myvu_audio_notification_text">Streaming glasses microphone audio to Hermes.</string>
+    <string name="myvu_audio_notification_title">MYVU glasses mode</string>
+    <string name="myvu_audio_preparing_text">Preparing on-device speech models</string>
+    <string name="myvu_audio_listening_text">Listening with on-device speech recognition</string>
+    <string name="myvu_audio_suspended_text">Local speech capture suspended</string>
+    <string name="myvu_audio_error_text">On-device speech preparation failed; tap glasses mode to retry</string>
     <string name="glasses_action_start">Start glasses mode</string>
     <string name="glasses_action_manage">Manage glasses mode</string>
     <string name="glasses_title">MYVU glasses</string>

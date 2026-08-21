@@ -2,7 +2,6 @@ package com.m57.hermescontrol.glasses.myvu
 
 import android.content.Intent
 import androidx.test.platform.app.InstrumentationRegistry
-import com.m57.hermescontrol.glasses.service.MyvuGlassesService
 import org.junit.Test
 
 /**
@@ -15,7 +14,6 @@ class MyvuAudioDiagnosticActivityTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         context.startActivity(
             Intent().setClassName(context, "com.m57.hermescontrol.glasses.myvu.MyvuDiagnosticActivity")
-                .putExtra(MyvuGlassesService.EXTRA_AUDIO_TOKEN, "hermes-myvu")
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
         )
         Thread.sleep(2_000)
