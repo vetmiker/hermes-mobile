@@ -18,12 +18,12 @@ internal object WhisperModelManifest {
 
     val whisper =
         WhisperModelArtifact(
-            id = "tiny.en-q5_1",
+            id = "base.en-q5_1",
             url =
                 "https://huggingface.co/ggerganov/whisper.cpp/resolve/" +
-                    "5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.en-q5_1.bin",
-            sizeBytes = 32_166_155,
-            sha256 = "c77c5766f1cef09b6b7d47f21b546cbddd4157886b3b5d6d4f709e91e66c7c2b",
+                    "5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en-q5_1.bin",
+            sizeBytes = 59_721_011,
+            sha256 = "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f",
             redirectHosts = huggingFaceHosts,
         )
     val vad =
