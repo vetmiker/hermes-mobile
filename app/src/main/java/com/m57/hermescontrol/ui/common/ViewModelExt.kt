@@ -4,7 +4,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.m57.hermescontrol.data.remote.NetworkResult
 import com.m57.hermescontrol.data.ws.ChangeEventHub
+import com.m57.hermescontrol.data.ws.WsEvent
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 
@@ -49,12 +51,13 @@ inline fun <T> ViewModel.safeLaunchLoad(
  */
 inline fun <T> ViewModel.refreshOnChange(
     eventType: String,
+    events: Flow<WsEvent.ChangeEvent> = ChangeEventHub.events,
     crossinline apiCall: suspend () -> NetworkResult<T>,
     crossinline onSuccess: (T) -> Unit,
 ): Job {
     var refreshInFlight = false
     return viewModelScope.launch {
-        ChangeEventHub.events
+        events
             .filter { it.type == eventType }
             .collect { _ ->
                 if (refreshInFlight) return@collect

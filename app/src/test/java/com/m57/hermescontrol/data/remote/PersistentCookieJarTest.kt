@@ -126,6 +126,41 @@ class PersistentCookieJarTest {
         }
 
     @Test
+    fun processRecreation_firstTicketRequestLoadsPersistedCookies() =
+        runTest {
+            val store = FakeEncryptedCookieStore()
+            val dashboard = "http://dashboard.local/".toHttpUrl()
+            val session =
+                PersistentCookieJar(
+                    store = store,
+                    storeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined),
+                    initialServerId = "dashboard",
+                )
+            session.saveFromResponse(
+                dashboard,
+                listOf(sessionCookie("dashboard.local", "persisted-session")),
+            )
+
+            // A process recreation creates a fresh jar. Its first request is
+            // the ticket mint on the HTTP client before the async preload can
+            // complete.
+            val recreatedSession =
+                PersistentCookieJar(
+                    store = store,
+                    storeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined),
+                    initialServerId = "dashboard",
+                )
+
+            val ticketCookies =
+                recreatedSession.loadForRequest(
+                    "http://dashboard.local/api/auth/ws-ticket".toHttpUrl(),
+                )
+
+            assertEquals(SESSION_COOKIE_NAME, ticketCookies.single().name)
+            assertEquals("persisted-session", ticketCookies.single().value)
+        }
+
+    @Test
     fun pruneServerCache_removesExpiredKeepsSession() =
         runTest {
             val jar = makeJar()

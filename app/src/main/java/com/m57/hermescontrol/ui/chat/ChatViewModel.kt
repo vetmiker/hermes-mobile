@@ -1,12 +1,16 @@
 package com.m57.hermescontrol.ui.chat
 
 import android.app.Application
+import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.util.Base64
 import android.util.Base64OutputStream
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.m57.hermescontrol.BuildConfig
 import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.local.HermesDatabase
 import com.m57.hermescontrol.data.local.SlashUsageStore
@@ -33,6 +37,11 @@ import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
 import com.m57.hermescontrol.data.ws.toJsonElement
+import com.m57.hermescontrol.glasses.ChatTurnCoordinatorProvider
+import com.m57.hermescontrol.glasses.GlassesModeControllerProvider
+import com.m57.hermescontrol.glasses.TurnRequest
+import com.m57.hermescontrol.glasses.TurnSource
+import com.m57.hermescontrol.glasses.service.MyvuGlassesService
 import com.m57.hermescontrol.ui.common.ActionProgressController
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -842,6 +851,15 @@ class ChatViewModel(
             }
 
             is WsEvent.MessageComplete -> {
+                // Release the process-scoped submission lease for every input
+                // source. The glasses service independently consumes voice
+                event.sessionId?.let { eventSessionId ->
+                    viewModelScope.launch(ioDispatcher) {
+                        ChatTurnCoordinatorProvider
+                            .get()
+                            .completeTerminalForRuntime(eventSessionId, event.text)
+                    }
+                }
                 // Buffers cleared before reduce; ViewModel resets them after
                 streamingController.resetStreaming()
             }
@@ -1194,6 +1212,51 @@ class ChatViewModel(
         }
     }
 
+    fun canStartGlasses(): Boolean {
+        val state = _uiState.value
+        return !state.currentSessionId.isNullOrBlank() &&
+            !runtimeSessionId.isNullOrBlank() &&
+            initialGlassesDisplay(
+                messages = state.messages,
+                isAgentTyping = state.isAgentTyping,
+                streamingMessage = state.streamingMessage,
+            ) != null
+    }
+
+    fun startGlasses(context: Context): Boolean {
+        val state = _uiState.value
+        val storedSessionId = state.currentSessionId
+        val activeRuntimeSessionId = runtimeSessionId
+        val initialDisplay =
+            initialGlassesDisplay(
+                messages = state.messages,
+                isAgentTyping = state.isAgentTyping,
+                streamingMessage = state.streamingMessage,
+            )
+        if (BuildConfig.MYVU_BRIDGE_TOKEN.isBlank() ||
+            storedSessionId.isNullOrBlank() ||
+            activeRuntimeSessionId.isNullOrBlank() ||
+            initialDisplay.isNullOrBlank()
+        ) {
+            return false
+        }
+        val intent =
+            Intent(context, MyvuGlassesService::class.java)
+                .setAction(MyvuGlassesService.ACTION_START)
+                .putExtra(MyvuGlassesService.EXTRA_AUDIO_TOKEN, BuildConfig.MYVU_BRIDGE_TOKEN)
+                .putExtra(MyvuGlassesService.EXTRA_STORED_SESSION_ID, storedSessionId)
+                .putExtra(MyvuGlassesService.EXTRA_RUNTIME_SESSION_ID, activeRuntimeSessionId)
+                .putExtra(MyvuGlassesService.EXTRA_INITIAL_DISPLAY, initialDisplay)
+        ContextCompat.startForegroundService(context, intent)
+        return true
+    }
+
+    fun endGlasses(context: Context) {
+        context.startService(
+            Intent(context, MyvuGlassesService::class.java).setAction(MyvuGlassesService.ACTION_STOP),
+        )
+    }
+
     // ── Send message ─────────────────────────────────────────────────────
 
     /**
@@ -1244,14 +1307,35 @@ class ChatViewModel(
                 isAgentTyping = true,
             )
         }
-
-        // Persist under the original Desktop session ID.
-        viewModelScope.launch(ioDispatcher) {
-            repo.persistMessage(userMessage, storageSessionId)
+        ActiveSessionHolder.set(agentSessionId, storageSessionId)
+        ChatTurnCoordinatorProvider.initialize(getApplication<Application>())
+        if (attachments.isEmpty()) {
+            viewModelScope.launch(ioDispatcher) {
+                val coordinator = ChatTurnCoordinatorProvider.get()
+                coordinator.claimPhonePriority(storageSessionId, agentSessionId)
+                GlassesModeControllerProvider.controller.claimPhonePriority(storageSessionId, agentSessionId)
+                coordinator.submit(
+                    TurnRequest(
+                        storedSessionId = storageSessionId,
+                        runtimeSessionId = agentSessionId,
+                        text = text,
+                        source = TurnSource.PHONE,
+                        isStreaming = wasStreaming,
+                    ),
+                )
+            }
+            return
         }
 
+        GlassesModeControllerProvider.controller.claimPhonePriority(storageSessionId, agentSessionId)
+
+        // Upload attachments, then enter the same final prompt-submit lease as
+        // ordinary phone turns. Upload RPCs are preparatory; only the final
+        // prompt may own the process-wide turn.
         // Upload attachments then submit prompt
         viewModelScope.launch(ioDispatcher) {
+            val coordinator = ChatTurnCoordinatorProvider.get()
+            coordinator.claimPhonePriority(storageSessionId, agentSessionId)
             val fileRefs = mutableListOf<String>()
 
             for (attachment in attachments) {
@@ -1322,24 +1406,20 @@ class ChatViewModel(
                         if (text.isNotBlank()) "\n\n$text" else ""
                 }
 
-            // While a turn is actively streaming and this is a plain text prompt
-            // (no attachments — session.redirect carries text only), steer the
-            // in-flight turn via session.redirect instead of queueing a fresh
-            // prompt.submit. The backend rewrites the live turn when it can, or
-            // queues the correction as the next turn otherwise (issue #710).
-            ActiveSessionHolder.set(agentSessionId, storageSessionId)
-            if (wasStreaming && attachments.isEmpty()) {
-                wsClient.sendRedirect(
-                    agentSessionId,
-                    fullText,
-                    onSent = { id -> trackRequest(id, WsMethods.SESSION_REDIRECT) },
+            val outcome =
+                coordinator.submit(
+                    TurnRequest(
+                        storedSessionId = storageSessionId,
+                        runtimeSessionId = agentSessionId,
+                        text = fullText,
+                        source = TurnSource.PHONE,
+                        isStreaming = wasStreaming,
+                    ),
                 )
-            } else {
-                wsClient.sendMessage(
-                    agentSessionId,
-                    fullText,
-                    onSent = { id -> trackRequest(id, WsMethods.PROMPT_SUBMIT) },
-                )
+            if (!outcome.accepted) {
+                _uiState.update {
+                    it.copy(errorMessage = "Another chat turn is still completing")
+                }
             }
         }
     }

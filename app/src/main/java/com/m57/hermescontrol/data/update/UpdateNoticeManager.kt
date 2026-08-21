@@ -50,13 +50,11 @@ object UpdateNoticeManager {
                     return@launch
                 }
             val info = result ?: return@launch
-            val apk = info.apkAsset ?: return@launch
             val state =
                 if (isNewerVersion(info.tagName, currentVersion)) {
                     AppUpdateState.UpdateAvailable(
                         latestTag = info.tagName,
-                        apkUrl = apk.browserDownloadUrl,
-                        sizeBytes = apk.size,
+                        releaseNotesUrl = info.htmlUrl.ifBlank { upstreamReleaseUrl(info.tagName) },
                     )
                 } else {
                     AppUpdateState.UpToDate(latestTag = info.tagName)
@@ -80,3 +78,6 @@ object UpdateNoticeManager {
         return persisted.takeIf { isNewerVersion(it, currentVersion) }
     }
 }
+
+internal fun upstreamReleaseUrl(tag: String): String =
+    "https://github.com/Hy4ri/hermes-mobile/releases/tag/${tag.trim()}"

@@ -159,10 +159,6 @@
     <string name="settings_about_update_uptodate">已是最新（v%1$s）</string>
     <string name="settings_about_update_available">发现新版本：v%1$s</string>
     <string name="settings_about_update_action">更新</string>
-    <string name="settings_about_update_downloading">下载中 %1$d%%</string>
-    <string name="settings_about_update_installing">安装 v%1$s…</string>
-    <string name="settings_about_update_allow_sources">允许安装来自此来源的应用</string>
-    <string name="settings_about_update_open_settings">打开设置</string>
     <string name="settings_about_update_retry">重试</string>
     <string name="settings_summary_profiles">已保存 %1$d 个</string>
     <string name="settings_summary_typing_on">打字效果已开启</string>

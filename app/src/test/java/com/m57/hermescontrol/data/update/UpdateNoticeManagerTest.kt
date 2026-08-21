@@ -36,14 +36,7 @@ class UpdateNoticeManagerTest {
     private fun updateInfo(tag: String = "v1.22.0"): UpdateInfo =
         UpdateInfo(
             tagName = tag,
-            assets =
-                listOf(
-                    UpdateInfo.Asset(
-                        name = "hermes-mobile-v1.22.0.apk",
-                        size = 12345678L,
-                        browserDownloadUrl = "https://example.com/hermes-mobile-v1.22.0.apk",
-                    ),
-                ),
+            htmlUrl = "https://github.com/Hy4ri/hermes-mobile/releases/tag/$tag",
         )
 
     @Before
@@ -147,8 +140,7 @@ class UpdateNoticeManagerTest {
         AppUpdateCache.update(
             AppUpdateState.UpdateAvailable(
                 latestTag = "v1.22.0",
-                apkUrl = "https://example.com/apk",
-                sizeBytes = 1L,
+                releaseNotesUrl = "https://github.com/Hy4ri/hermes-mobile/releases/tag/v1.22.0",
             ),
         )
         every { AuthManager.getLastKnownLatestTag() } returns "v0.9.0"
@@ -199,8 +191,7 @@ class UpdateNoticeManagerTest {
         AppUpdateCache.update(
             AppUpdateState.UpdateAvailable(
                 latestTag = "v1.22.0",
-                apkUrl = "https://example.com/apk",
-                sizeBytes = 1L,
+                releaseNotesUrl = "https://github.com/Hy4ri/hermes-mobile/releases/tag/v1.22.0",
             ),
         )
         every { AuthManager.getLastKnownLatestTag() } returns "v1.22.0"

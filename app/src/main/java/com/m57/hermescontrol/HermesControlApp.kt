@@ -10,6 +10,8 @@ import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.remote.NetworkMonitor
 import com.m57.hermescontrol.data.remote.OkHttpProvider
 import com.m57.hermescontrol.data.update.UpdateNoticeManager
+import com.m57.hermescontrol.glasses.ChatTurnCoordinatorProvider
+import com.m57.hermescontrol.glasses.myvu.GlassesReadabilityStore
 import com.m57.hermescontrol.ui.analytics.AnalyticsPreloader
 
 class HermesControlApp :
@@ -22,6 +24,8 @@ class HermesControlApp :
         // separate standalone/default code path anywhere in the app.
         AuthManager.ensureDefaultProfile()
         NetworkMonitor.init(this)
+        ChatTurnCoordinatorProvider.initialize(this)
+        GlassesReadabilityStore.initialize(this)
         // Issue #537 follow-up (A): preload analytics in the background after launch
         // so the tab renders instantly when opened (the usage endpoint is slow on a
         // cold backend). Fire-and-forget; never blocks UI startup.

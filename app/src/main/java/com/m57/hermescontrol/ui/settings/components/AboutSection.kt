@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -29,8 +28,7 @@ import com.m57.hermescontrol.ui.settings.SectionCard
 internal fun AboutSection(
     updateState: AppUpdateState = AppUpdateState.Idle,
     onCheckUpdate: () -> Unit = {},
-    onStartUpdate: () -> Unit = {},
-    onOpenInstallSettings: () -> Unit = {},
+    onOpenReleaseNotes: () -> Unit = {},
 ) {
     SectionCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -54,8 +52,7 @@ internal fun AboutSection(
         UpdateRow(
             state = updateState,
             onCheckUpdate = onCheckUpdate,
-            onStartUpdate = onStartUpdate,
-            onOpenInstallSettings = onOpenInstallSettings,
+            onOpenReleaseNotes = onOpenReleaseNotes,
         )
         InfoRow(
             label = stringResource(R.string.settings_about_build),
@@ -88,15 +85,13 @@ internal fun AboutSection(
 private fun UpdateRow(
     state: AppUpdateState,
     onCheckUpdate: () -> Unit,
-    onStartUpdate: () -> Unit,
-    onOpenInstallSettings: () -> Unit,
+    onOpenReleaseNotes: () -> Unit,
 ) {
     // GitHub release tags carry a leading "v" (e.g. "v1.21.1"); the string
     // templates below already prepend one, so strip it here to avoid "vv".
     val tag =
         (state as? AppUpdateState.UpToDate)?.latestTag
             ?: (state as? AppUpdateState.UpdateAvailable)?.latestTag
-            ?: (state as? AppUpdateState.Installing)?.latestTag
     val displayTag = tag?.trimStart('v').orEmpty()
     val tappable =
         state is AppUpdateState.Idle ||
@@ -140,56 +135,19 @@ private fun UpdateRow(
                     )
                 }
 
-                is AppUpdateState.Downloading -> {
-                    ValueText(
-                        stringResource(
-                            R.string.settings_about_update_downloading,
-                            (state.progress * 100).toInt(),
-                        ),
-                    )
-                }
-
-                is AppUpdateState.Installing -> {
-                    ValueText(
-                        stringResource(R.string.settings_about_update_installing, displayTag),
-                    )
-                }
-
-                is AppUpdateState.NeedsUnknownSourcesPermission -> {
-                    ValueText(stringResource(R.string.settings_about_update_allow_sources))
-                }
-
                 is AppUpdateState.Error -> {
                     ValueText(state.message)
                 }
             }
         }
 
-        // Action area: the button/progress gets its own full-width line so a
-        // long status text or error message never fights it for space.
         when (state) {
             is AppUpdateState.UpdateAvailable -> {
                 Button(
-                    onClick = onStartUpdate,
+                    onClick = onOpenReleaseNotes,
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 ) {
                     Text(stringResource(R.string.settings_about_update_action))
-                }
-            }
-
-            is AppUpdateState.Downloading -> {
-                LinearProgressIndicator(
-                    progress = { state.progress },
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                )
-            }
-
-            is AppUpdateState.NeedsUnknownSourcesPermission -> {
-                OutlinedButton(
-                    onClick = onOpenInstallSettings,
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                ) {
-                    Text(stringResource(R.string.settings_about_update_open_settings))
                 }
             }
 
