@@ -386,10 +386,17 @@ class GlassesModeController {
             (storedSessionId == null || this.storedSessionId == storedSessionId) &&
             (runtimeSessionId == null || this.runtimeSessionId == runtimeSessionId)
 
-    private fun isEndPhrase(text: String): Boolean = text.trim().lowercase().replace(WHITESPACE, " ") in END_PHRASES
+    private fun isEndPhrase(text: String): Boolean =
+        text
+            .trim()
+            .lowercase()
+            .replace(WHITESPACE, " ")
+            .trim { it in END_PHRASE_EDGE_PUNCTUATION }
+            .trim() in END_PHRASES
 
     private companion object {
         val WHITESPACE = Regex("\\s+")
+        const val END_PHRASE_EDGE_PUNCTUATION = ".!?…"
         val END_PHRASES = setOf("end glasses mode", "stop glasses mode")
     }
 }
