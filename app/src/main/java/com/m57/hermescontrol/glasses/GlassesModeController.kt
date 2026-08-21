@@ -84,6 +84,96 @@ class GlassesModeController {
     }
 
     @Synchronized
+    fun beginTranscription(
+        generation: Long,
+        streamId: String,
+        utteranceId: String,
+    ): TranscriptFence? {
+        val current = _snapshot.value
+        if (
+            !current.matches(generation) ||
+            current.state != GlassesModeState.LISTENING ||
+            current.activeStreamId != streamId
+        ) {
+            return null
+        }
+        val fence =
+            TranscriptFence(
+                generation = current.generation,
+                storedSessionId = checkNotNull(current.storedSessionId),
+                runtimeSessionId = checkNotNull(current.runtimeSessionId),
+                utteranceId = utteranceId,
+            )
+        _snapshot.value =
+            current.copy(
+                state = GlassesModeState.TRANSCRIBING,
+                activeStreamId = null,
+                pendingUtteranceId = utteranceId,
+                inFlightTurnId = "${current.generation}:$utteranceId",
+            )
+        return fence
+    }
+
+    @Synchronized
+    fun completeTranscript(
+        fence: TranscriptFence,
+        text: String,
+    ): TranscriptAcceptance {
+        val current = _snapshot.value
+        if (!current.matches(fence.generation, fence.storedSessionId, fence.runtimeSessionId) ||
+            current.state != GlassesModeState.TRANSCRIBING ||
+            current.pendingUtteranceId != fence.utteranceId ||
+            current.inFlightTurnId != "${fence.generation}:${fence.utteranceId}"
+        ) {
+            return TranscriptAcceptance(false, reason = "stale transcription fence")
+        }
+        val normalized = text.trim()
+        if (normalized.isEmpty()) {
+            _snapshot.value = current.openListeningEpoch()
+            return TranscriptAcceptance(false, reason = "empty transcript")
+        }
+        if (isEndPhrase(normalized)) {
+            end()
+            return TranscriptAcceptance(false, ended = true)
+        }
+        _snapshot.value = current.copy(state = GlassesModeState.AWAITING_HERMES, activeStreamId = null)
+        return TranscriptAcceptance(true, fence = fence)
+    }
+
+    @Synchronized
+    fun failTranscript(
+        fence: TranscriptFence,
+        detail: String,
+    ): Boolean {
+        val current = _snapshot.value
+        if (!current.matches(fence.generation, fence.storedSessionId, fence.runtimeSessionId) ||
+            current.state != GlassesModeState.TRANSCRIBING ||
+            current.pendingUtteranceId != fence.utteranceId
+        ) {
+            return false
+        }
+        _snapshot.value = current.openListeningEpoch().copy(detail = detail)
+        return true
+    }
+
+    @Synchronized
+    fun failSubmission(
+        fence: TranscriptFence,
+        detail: String,
+    ): Boolean {
+        val current = _snapshot.value
+        if (!isTranscriptFenceActive(fence)) return false
+        _snapshot.value =
+            current.copy(
+                state = GlassesModeState.SUSPENDED,
+                pendingUtteranceId = null,
+                inFlightTurnId = null,
+                detail = detail,
+            )
+        return true
+    }
+
+    @Synchronized
     fun acceptTranscript(
         generation: Long,
         streamId: String,
@@ -228,6 +318,21 @@ class GlassesModeController {
     }
 
     @Synchronized
+    fun error(detail: String) {
+        val current = _snapshot.value
+        if (current.state != GlassesModeState.INACTIVE) {
+            _snapshot.value =
+                current.copy(
+                    state = GlassesModeState.ERROR,
+                    activeStreamId = null,
+                    pendingUtteranceId = null,
+                    inFlightTurnId = null,
+                    detail = detail,
+                )
+        }
+    }
+
+    @Synchronized
     fun suspend(detail: String) {
         val current = _snapshot.value
         if (current.state != GlassesModeState.INACTIVE) {
@@ -281,10 +386,17 @@ class GlassesModeController {
             (storedSessionId == null || this.storedSessionId == storedSessionId) &&
             (runtimeSessionId == null || this.runtimeSessionId == runtimeSessionId)
 
-    private fun isEndPhrase(text: String): Boolean = text.trim().lowercase().replace(WHITESPACE, " ") in END_PHRASES
+    private fun isEndPhrase(text: String): Boolean =
+        text
+            .trim()
+            .lowercase()
+            .replace(WHITESPACE, " ")
+            .trim { it in END_PHRASE_EDGE_PUNCTUATION }
+            .trim() in END_PHRASES
 
     private companion object {
         val WHITESPACE = Regex("\\s+")
+        const val END_PHRASE_EDGE_PUNCTUATION = ".!?…"
         val END_PHRASES = setOf("end glasses mode", "stop glasses mode")
     }
 }

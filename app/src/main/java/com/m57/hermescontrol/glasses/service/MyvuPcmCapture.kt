@@ -1,5 +1,6 @@
 package com.m57.hermescontrol.glasses.service
 
+import android.annotation.SuppressLint
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -12,10 +13,29 @@ import androidx.annotation.RequiresPermission
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
 
+@SuppressLint("MissingPermission")
+private fun buildAudioRecord(
+    format: AudioFormat,
+    bufferSize: Int,
+): AudioRecord =
+    AudioRecord.Builder()
+        .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+        .setAudioFormat(format)
+        .setBufferSizeInBytes(bufferSize)
+        .build()
+
 /** Captures the MYVU Bluetooth SCO communication device as 16 kHz mono PCM16. */
 class MyvuPcmCapture(
     private val audioManager: AudioManager,
     private val onPcm: (ByteArray, Int) -> Unit,
+    private val minimumBufferSize: () -> Int = {
+        AudioRecord.getMinBufferSize(
+            SAMPLE_RATE_HZ,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+        )
+    },
+    private val recorderFactory: (AudioFormat, Int) -> AudioRecord = ::buildAudioRecord,
 ) : Closeable {
     private val capturing = AtomicBoolean(false)
     private var recorder: AudioRecord? = null
@@ -46,19 +66,9 @@ class MyvuPcmCapture(
                     .setSampleRate(SAMPLE_RATE_HZ)
                     .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
                     .build()
-            val minimumBuffer =
-                AudioRecord.getMinBufferSize(
-                    SAMPLE_RATE_HZ,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                )
+            val minimumBuffer = minimumBufferSize()
             check(minimumBuffer > 0) { "AudioRecord does not support 16 kHz mono PCM16" }
-            val activeRecorder =
-                AudioRecord.Builder()
-                    .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
-                    .setAudioFormat(format)
-                    .setBufferSizeInBytes(maxOf(minimumBuffer, PCM_FRAME_BYTES * 4))
-                    .build()
+            val activeRecorder = recorderFactory(format, maxOf(minimumBuffer, PCM_FRAME_BYTES * 4))
             check(activeRecorder.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord initialization failed" }
             recorder = activeRecorder
             activeRecorder.startRecording()

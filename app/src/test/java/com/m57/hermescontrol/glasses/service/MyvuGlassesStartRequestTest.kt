@@ -6,10 +6,9 @@ import org.junit.Test
 
 class MyvuGlassesStartRequestTest {
     @Test
-    fun accepts_a_complete_initial_display_with_authenticated_session_ids() {
+    fun accepts_a_complete_initial_display_without_a_bridge_token() {
         assertTrue(
             MyvuGlassesStartRequest(
-                token = "token",
                 storedSessionId = "stored",
                 runtimeSessionId = "runtime",
                 initialDisplay = "You:\nprompt\n\nHermes:\nresponse",
@@ -18,10 +17,9 @@ class MyvuGlassesStartRequestTest {
     }
 
     @Test
-    fun rejects_blank_initial_display_alongside_missing_start_credentials() {
+    fun rejects_blank_initial_display_or_missing_session_identity() {
         assertFalse(
             MyvuGlassesStartRequest(
-                token = "token",
                 storedSessionId = "stored",
                 runtimeSessionId = "runtime",
                 initialDisplay = "   ",
@@ -29,8 +27,7 @@ class MyvuGlassesStartRequestTest {
         )
         assertFalse(
             MyvuGlassesStartRequest(
-                token = "",
-                storedSessionId = "stored",
+                storedSessionId = null,
                 runtimeSessionId = "runtime",
                 initialDisplay = "display",
             ).isValid,

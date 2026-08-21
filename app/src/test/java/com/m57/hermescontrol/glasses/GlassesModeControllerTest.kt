@@ -32,6 +32,46 @@ class GlassesModeControllerTest {
     }
 
     @Test
+    fun endpoint_claim_requires_exact_transcribing_fence_before_commit() {
+        val controller = GlassesModeController()
+        val listening = startListening(controller, "stored", "runtime")
+        val fence =
+            checkNotNull(
+                controller.beginTranscription(
+                    listening.generation,
+                    checkNotNull(listening.activeStreamId),
+                    "utterance",
+                ),
+            )
+
+        assertEquals(GlassesModeState.TRANSCRIBING, controller.snapshot.value.state)
+        assertFalse(controller.completeTranscript(fence, " ").accepted)
+        assertEquals(GlassesModeState.LISTENING, controller.snapshot.value.state)
+        assertFalse(controller.isTranscriptFenceActive(fence))
+    }
+
+    @Test
+    fun submission_failure_releases_the_matching_awaiting_transcript_fence() {
+        val controller = GlassesModeController()
+        val listening = startListening(controller, "stored", "runtime")
+        val fence =
+            checkNotNull(
+                controller.acceptTranscript(
+                    listening.generation,
+                    checkNotNull(listening.activeStreamId),
+                    "utterance",
+                    "hello",
+                ).fence,
+            )
+
+        assertTrue(controller.failSubmission(fence, "Voice submission failed"))
+        assertEquals(GlassesModeState.SUSPENDED, controller.snapshot.value.state)
+        assertFalse(controller.isTranscriptFenceActive(fence))
+        assertNull(controller.snapshot.value.pendingUtteranceId)
+        assertNull(controller.snapshot.value.inFlightTurnId)
+    }
+
+    @Test
     fun accepted_transcript_fence_is_invalidated_by_end_or_chat_switch() {
         val controller = GlassesModeController()
         val first = startListening(controller, "stored-a", "runtime-a")
@@ -105,31 +145,13 @@ class GlassesModeControllerTest {
 
     @Test
     fun only_exact_normalized_end_phrases_end_mode() {
-        val controller = GlassesModeController()
-        val started = startListening(controller, "stored", "runtime")
+        assertEndCommand("end glasses mode.")
+        assertEndCommand(" Stop Glasses Mode! ")
+        assertEndCommand("\tEND \nGLASSES MODE…\n")
 
-        val ordinaryPrompt =
-            controller.acceptTranscript(
-                started.generation,
-                started.activeStreamId!!,
-                "one",
-                "please end glasses mode now",
-            )
-        assertTrue(ordinaryPrompt.accepted)
-        assertFalse(ordinaryPrompt.ended)
-        assertEquals(GlassesModeState.AWAITING_HERMES, controller.snapshot.value.state)
-        controller.end()
-        val second = startListening(controller, "stored", "runtime")
-        val end =
-            controller.acceptTranscript(
-                second.generation,
-                second.activeStreamId!!,
-                "two",
-                " Stop Glasses Mode ",
-            )
-        assertFalse(end.accepted)
-        assertTrue(end.ended)
-        assertEquals(GlassesModeState.INACTIVE, controller.snapshot.value.state)
+        assertOrdinaryTranscript("please stop glasses mode.")
+        assertOrdinaryTranscript("stop glasses mode later")
+        assertOrdinaryTranscript("stop, glasses mode")
     }
 
     @Test
@@ -202,5 +224,43 @@ class GlassesModeControllerTest {
             ),
         )
         return controller.snapshot.value
+    }
+
+    private fun assertEndCommand(text: String) {
+        val controller = GlassesModeController()
+        val listening = startListening(controller, "stored", "runtime")
+        val fence =
+            checkNotNull(
+                controller.beginTranscription(
+                    listening.generation,
+                    checkNotNull(listening.activeStreamId),
+                    "utterance",
+                ),
+            )
+
+        val acceptance = controller.completeTranscript(fence, text)
+
+        assertFalse(acceptance.accepted)
+        assertTrue(acceptance.ended)
+        assertEquals(GlassesModeState.INACTIVE, controller.snapshot.value.state)
+    }
+
+    private fun assertOrdinaryTranscript(text: String) {
+        val controller = GlassesModeController()
+        val listening = startListening(controller, "stored", "runtime")
+        val fence =
+            checkNotNull(
+                controller.beginTranscription(
+                    listening.generation,
+                    checkNotNull(listening.activeStreamId),
+                    "utterance",
+                ),
+            )
+
+        val acceptance = controller.completeTranscript(fence, text)
+
+        assertTrue(acceptance.accepted)
+        assertFalse(acceptance.ended)
+        assertEquals(GlassesModeState.AWAITING_HERMES, controller.snapshot.value.state)
     }
 }

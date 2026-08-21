@@ -1,10 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
-        <!-- Debug-only visible U3 hardware gate. It starts capture only after
-             its own foreground permission callback; release has no entry. -->
+        <!-- Debug-only in-process hardware diagnostic; no other app may launch it. -->
         <activity
             android:name=".glasses.myvu.MyvuDiagnosticActivity"
-            android:exported="true" />
+            android:exported="false" />
     </application>
 </manifest>

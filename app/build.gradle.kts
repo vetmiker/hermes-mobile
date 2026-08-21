@@ -8,12 +8,6 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
-val myvuBridgeToken = providers.environmentVariable("MYVU_BRIDGE_TOKEN").orNull.orEmpty()
-val isReleasePackaging = gradle.startParameter.taskNames.any { taskName ->
-    taskName.contains("assembleRelease", ignoreCase = true) ||
-        taskName.contains("bundleRelease", ignoreCase = true) ||
-        taskName.contains("packageRelease", ignoreCase = true)
-}
 
 android {
     namespace = "com.m57.hermescontrol"
@@ -23,6 +17,7 @@ android {
     }
     compileSdk = 37
     buildToolsVersion = "37.0.0"
+    ndkVersion = "25.2.9519653"
     defaultConfig {
         applicationId = "com.m57.hermescontrol"
         minSdk = 26
@@ -53,7 +48,14 @@ android {
                 commandLine("git", "rev-parse", "--short", "HEAD")
             }.standardOutput.asText.get().trim()
         buildConfigField("String", "GIT_SHA", "\"$gitSha\"")
-        buildConfigField("String", "MYVU_BRIDGE_TOKEN", "\"$myvuBridgeToken\"")
+        externalNativeBuild {
+            cmake {
+                cppFlags += listOf("-std=c++17")
+            }
+        }
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
     signingConfigs {
@@ -100,15 +102,18 @@ android {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
         }
         release {
-            require(!isReleasePackaging || myvuBridgeToken.isNotBlank()) {
-                "MYVU_BRIDGE_TOKEN is required when packaging a release"
-            }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs["release"]
             buildConfigField("boolean", "ALLOW_CLEARTEXT", "true")
             manifestPlaceholders["usesCleartextTraffic"] = "true"
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
     compileOptions {

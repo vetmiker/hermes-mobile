@@ -43,8 +43,9 @@
             systemImageTypes = ["google_apis"];
             abiVersions = ["x86_64"];
 
-            # NDK (not needed for this project, but handy)
-            includeNDK = false;
+            # Native Whisper builds require the Android NDK; Gradle pins the
+            # exact 25.2.9519653 revision and CMake 3.22.1.
+            includeNDK = true;
 
             # Extra licenses
             extraLicenses = [

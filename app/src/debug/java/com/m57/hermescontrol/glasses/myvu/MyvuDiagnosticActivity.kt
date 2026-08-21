@@ -8,7 +8,6 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
 import androidx.core.content.ContextCompat
-import com.m57.hermescontrol.BuildConfig
 import com.m57.hermescontrol.glasses.service.MyvuGlassesService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -105,14 +104,7 @@ class MyvuDiagnosticActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (intent.getBooleanExtra(EXTRA_START_AUDIO, false)) {
-            val audioToken = BuildConfig.MYVU_BRIDGE_TOKEN
-            if (audioToken.isBlank()) {
-                MyvuDiagnosticGate.failed("MYVU_BRIDGE_TOKEN is not configured for this build")
-                Log.e(TAG, "MYVU_AUDIO_DIAGNOSTIC start refused tokenConfigured=false")
-                finish()
-            } else {
-                startAudioAfterVisiblePermission(audioToken)
-            }
+            startAudioAfterVisiblePermission()
             return
         }
         if (intent.getBooleanExtra(EXTRA_STOP_AUDIO, false)) {
@@ -166,11 +158,10 @@ class MyvuDiagnosticActivity : Activity() {
         super.onDestroy()
     }
 
-    private fun startAudioAfterVisiblePermission(token: String) {
+    private fun startAudioAfterVisiblePermission() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-            startAudio(token)
+            startAudio()
         } else {
-            pendingAudioToken = token
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
         }
     }
@@ -181,26 +172,22 @@ class MyvuDiagnosticActivity : Activity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        val token = pendingAudioToken
-        pendingAudioToken = null
         if (
             requestCode == REQUEST_RECORD_AUDIO &&
-            token != null &&
             grantResults.singleOrNull() == PackageManager.PERMISSION_GRANTED
         ) {
-            startAudio(token)
+            startAudio()
         } else {
             MyvuDiagnosticGate.failed("Microphone permission was not granted")
             finish()
         }
     }
 
-    private fun startAudio(token: String) {
+    private fun startAudio() {
         ContextCompat.startForegroundService(
             this,
             Intent(this, MyvuGlassesService::class.java)
                 .setAction(MyvuGlassesService.ACTION_START)
-                .putExtra(MyvuGlassesService.EXTRA_AUDIO_TOKEN, token)
                 .putExtra(MyvuGlassesService.EXTRA_STORED_SESSION_ID, DIAGNOSTIC_SESSION_ID)
                 .putExtra(MyvuGlassesService.EXTRA_RUNTIME_SESSION_ID, DIAGNOSTIC_SESSION_ID)
                 .putExtra(MyvuGlassesService.EXTRA_INITIAL_DISPLAY, DIAGNOSTIC_INITIAL_DISPLAY),
@@ -208,8 +195,6 @@ class MyvuDiagnosticActivity : Activity() {
         Log.i(TAG, "MYVU_AUDIO_DIAGNOSTIC start requested")
         finish()
     }
-
-    private var pendingAudioToken: String? = null
 
     private companion object {
         const val TAG = "HermesMyvuDiag"
