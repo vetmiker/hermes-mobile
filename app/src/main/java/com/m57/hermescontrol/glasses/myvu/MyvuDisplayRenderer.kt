@@ -49,6 +49,7 @@ class MyvuDisplayRenderer(
 ) {
     private var activeDocumentKey: String? = null
 
+    @Synchronized
     fun commandsFor(
         text: String,
         kind: DisplayKind,
@@ -93,6 +94,24 @@ class MyvuDisplayRenderer(
                 payload = fontPayload,
                 documentKey = documentKey,
                 fontMode = readability.fontMode,
+            ),
+        )
+    }
+
+    /**
+     * Replaces the visible text in the active response document without opening
+     * another MYVU scene.
+     */
+    @Synchronized
+    fun updateResponse(text: String): List<MyvuDisplayCommand> {
+        require(text.isNotEmpty()) { "Display text cannot be empty" }
+        val documentKey = checkNotNull(activeDocumentKey) { "A response document must be opened first" }
+        return listOf(
+            MyvuDisplayCommand(
+                receiverPackage = MyvuProtocol.LAUNCHER_RECEIVER,
+                senderPackage = PERSONAL_PACKAGE,
+                payload = sendContent(text, documentKey),
+                documentKey = documentKey,
             ),
         )
     }

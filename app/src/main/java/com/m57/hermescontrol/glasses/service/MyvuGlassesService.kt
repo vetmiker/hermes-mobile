@@ -16,12 +16,13 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.ws.HermesWsClient
-import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.glasses.ChatTurnCoordinatorProvider
 import com.m57.hermescontrol.glasses.GlassesModeControllerProvider
+import com.m57.hermescontrol.glasses.GlassesModeSnapshot
 import com.m57.hermescontrol.glasses.GlassesModeState
 import com.m57.hermescontrol.glasses.TranscriptFence
 import com.m57.hermescontrol.glasses.TurnLease
+import com.m57.hermescontrol.glasses.VoiceTranscriptUiEvent
 import com.m57.hermescontrol.glasses.myvu.DisplayKind
 import com.m57.hermescontrol.glasses.myvu.GlassesReadabilityStore
 import com.m57.hermescontrol.glasses.myvu.MyvuDisplayRenderer
@@ -105,6 +106,28 @@ internal class MyvuPreparationSessionGate {
     }
 }
 
+internal suspend fun terminalLeaseReleased(
+    snapshot: GlassesModeSnapshot,
+    voiceLease: TurnLease?,
+    text: String,
+    completeVoice: suspend (TurnLease, String, String) -> Boolean,
+    completePhone: suspend (String, String) -> TurnLease?,
+): Boolean {
+    val runtimeSessionId = snapshot.runtimeSessionId ?: return false
+    return when {
+        voiceLease != null -> {
+            if (voiceLease.runtimeSessionId != runtimeSessionId) return false
+            completeVoice(voiceLease, runtimeSessionId, text)
+        }
+
+        snapshot.state == GlassesModeState.PHONE_PRIORITY -> {
+            completePhone(runtimeSessionId, text) != null
+        }
+
+        else -> false
+    }
+}
+
 /** Owns the visible MYVU session. Raw PCM never leaves this process. */
 class MyvuGlassesService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -114,6 +137,7 @@ class MyvuGlassesService : Service() {
     private var engine: WhisperEngine? = null
     private var pipeline: LocalSpeechPipeline? = null
     private var activeVoiceLease: TurnLease? = null
+    private var sessionEventRouter: MyvuSessionEventRouter? = null
     private var sessionJob: Job? = null
     private val preparationSessions = MyvuPreparationSessionGate()
 
@@ -259,45 +283,23 @@ class MyvuGlassesService : Service() {
         scope: CoroutineScope,
         currentTransport: MyvuTransport,
     ) {
+        val eventRouter =
+            MyvuSessionEventRouter(
+                publisher =
+                    MyvuTurnStreamPublisher(
+                        renderer = renderer,
+                        readability = { GlassesReadabilityStore.readability.value },
+                        writer = MyvuCommandWriter(currentTransport::send),
+                    ),
+                currentSnapshot = { GlassesModeControllerProvider.controller.snapshot.value },
+                onFinalDelivered = { snapshot, text ->
+                    serviceScope.launch { completeTerminalAfterDisplay(snapshot, text, scope) }
+                },
+            )
+        sessionEventRouter = eventRouter
+
         scope.launch {
-            HermesWsClient.events.collect { event ->
-                if (event !is WsEvent.MessageComplete) return@collect
-                val current = GlassesModeControllerProvider.controller.snapshot.value
-                val runtimeSessionId = current.runtimeSessionId ?: return@collect
-                val storedSessionId = current.storedSessionId ?: return@collect
-                if (runtimeSessionId != event.sessionId) return@collect
-                activeVoiceLease?.let {
-                    ChatTurnCoordinatorProvider.get().completeTerminal(
-                        it,
-                        runtimeSessionId,
-                        event.text,
-                    )
-                }
-                if (
-                    activeVoiceLease == null &&
-                    current.state != GlassesModeState.PHONE_PRIORITY
-                ) {
-                    return@collect
-                }
-                activeVoiceLease = null
-                if (GlassesModeControllerProvider.controller.acceptTerminal(
-                        current.generation,
-                        storedSessionId,
-                        runtimeSessionId,
-                        event.text,
-                    )
-                ) {
-                    render(event.text, DisplayKind.Response)
-                    if (GlassesModeControllerProvider.controller.displayCompleted(
-                            current.generation,
-                            storedSessionId,
-                            runtimeSessionId,
-                        )
-                    ) {
-                        resumeCapture(scope)
-                    }
-                }
-            }
+            HermesWsClient.events.collect(eventRouter::route)
         }
         scope.launch {
             GlassesModeControllerProvider.controller.snapshot.collect { snapshot ->
@@ -318,6 +320,44 @@ class MyvuGlassesService : Service() {
                     stopSelf()
                 }
             }
+        }
+    }
+
+    private suspend fun completeTerminalAfterDisplay(
+        snapshot: GlassesModeSnapshot,
+        text: String,
+        scope: CoroutineScope,
+    ) {
+        val storedSessionId = snapshot.storedSessionId ?: return
+        val runtimeSessionId = snapshot.runtimeSessionId ?: return
+        val voiceLease = activeVoiceLease
+        val coordinator = ChatTurnCoordinatorProvider.get()
+        if (
+            !terminalLeaseReleased(
+                snapshot = snapshot,
+                voiceLease = voiceLease,
+                text = text,
+                completeVoice = coordinator::completeTerminal,
+                completePhone = coordinator::completeTerminalForRuntime,
+            )
+        ) {
+            return
+        }
+        if (voiceLease != null && activeVoiceLease == voiceLease) activeVoiceLease = null
+        if (
+            GlassesModeControllerProvider.controller.acceptTerminal(
+                snapshot.generation,
+                storedSessionId,
+                runtimeSessionId,
+                text,
+            ) &&
+            GlassesModeControllerProvider.controller.displayCompleted(
+                snapshot.generation,
+                storedSessionId,
+                runtimeSessionId,
+            )
+        ) {
+            resumeCapture(scope)
         }
     }
 
@@ -409,10 +449,22 @@ class MyvuGlassesService : Service() {
             }
             return
         }
+        render(text, DisplayKind.Input)
+        ChatTurnCoordinatorProvider.publishVoiceTranscript(
+            VoiceTranscriptUiEvent.Published(
+                storedSessionId = fence.storedSessionId,
+                runtimeSessionId = fence.runtimeSessionId,
+                utteranceId = fence.utteranceId,
+                text = text,
+            ),
+        )
         serviceScope.launch {
             try {
                 val coordinator = ChatTurnCoordinatorProvider.get()
-                if (!controller.isTranscriptFenceActive(fence)) return@launch
+                if (!controller.isTranscriptFenceActive(fence)) {
+                    submissionFailed(fence, "Voice submission cancelled")
+                    return@launch
+                }
                 val reservation =
                     coordinator.reserveVoice(
                         fence.storedSessionId,
@@ -421,12 +473,13 @@ class MyvuGlassesService : Service() {
                     )
                 if (!controller.isTranscriptFenceActive(fence)) {
                     coordinator.discardVoice(reservation)
+                    submissionFailed(fence, "Voice submission cancelled")
                     return@launch
                 }
                 val outcome = coordinator.commitVoice(reservation, text)
                 if (outcome.accepted) {
                     activeVoiceLease = outcome.lease
-                } else if (controller.isTranscriptFenceActive(fence)) {
+                } else {
                     submissionFailed(fence, "Another chat turn is still completing")
                 }
             } catch (error: Throwable) {
@@ -448,6 +501,13 @@ class MyvuGlassesService : Service() {
         fence: TranscriptFence,
         detail: String,
     ) {
+        ChatTurnCoordinatorProvider.publishVoiceTranscript(
+            VoiceTranscriptUiEvent.SubmissionFailed(
+                storedSessionId = fence.storedSessionId,
+                runtimeSessionId = fence.runtimeSessionId,
+                utteranceId = fence.utteranceId,
+            ),
+        )
         activeVoiceLease = null
         if (GlassesModeControllerProvider.controller.failSubmission(fence, detail)) {
             render(detail, DisplayKind.Status)
@@ -477,6 +537,8 @@ class MyvuGlassesService : Service() {
 
     private fun stopSession() {
         preparationSessions.invalidate()
+        sessionEventRouter?.close()
+        sessionEventRouter = null
         sessionJob?.cancel()
         sessionJob = null
         stopCapture()

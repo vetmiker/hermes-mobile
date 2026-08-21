@@ -60,4 +60,16 @@ class MyvuDisplayRendererTest {
         assertEquals(GlassesFontMode.Large, commands.fontCommand?.fontMode)
         assertTrue(commands[1].payload.contains("A long response must be projected in full."))
     }
+
+    @Test
+    fun responseUpdateSendsOnlyContentToTheActiveDocument() {
+        val renderer = MyvuDisplayRenderer(documentId = { "doc" })
+        val opened = renderer.commandsFor("Partial", DisplayKind.Response)
+
+        val update = renderer.updateResponse("Partial answer")
+
+        assertEquals(1, update.size)
+        assertEquals(opened.single { it.payload.contains("send_content") }.documentKey, update.single().documentKey)
+        assertTrue(update.single().payload.contains("Partial answer"))
+    }
 }
