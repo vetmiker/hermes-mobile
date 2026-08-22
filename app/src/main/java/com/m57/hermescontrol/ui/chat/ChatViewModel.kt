@@ -41,11 +41,13 @@ import com.m57.hermescontrol.glasses.GlassesModeControllerProvider
 import com.m57.hermescontrol.glasses.GlassesModeState
 import com.m57.hermescontrol.glasses.TurnRequest
 import com.m57.hermescontrol.glasses.TurnSource
+import com.m57.hermescontrol.glasses.VoiceTranscriptUiEvent
 import com.m57.hermescontrol.glasses.service.MyvuGlassesService
 import com.m57.hermescontrol.ui.common.ActionProgressController
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -399,6 +401,11 @@ class ChatViewModel(
     slashUsageStore: SlashUsageStore = SlashUsageStore(application.applicationContext),
     searchDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.Default,
     private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.IO,
+    private val voiceTranscriptEvents: Flow<VoiceTranscriptUiEvent> =
+        ChatTurnCoordinatorProvider.voiceTranscriptEvents,
+    private val terminalLeaseReleaser: suspend (String, String) -> Unit = { runtimeSessionId, text ->
+        ChatTurnCoordinatorProvider.get().completeTerminalForRuntime(runtimeSessionId, text)
+    },
 ) : AndroidViewModel(application) {
     constructor(application: Application) : this(application, startCleanup = true)
 
@@ -406,6 +413,7 @@ class ChatViewModel(
     private val _uiState = MutableStateFlow(ChatUiState())
 
     private val _streamingState = MutableStateFlow(StreamingState())
+    private val optimisticVoiceTranscriptIds = ConcurrentHashMap.newKeySet<String>()
 
     /** Maps an in-flight RPC id to its method for UI error labeling. */
     private val idToMethod = ConcurrentHashMap<String, String>()
@@ -556,6 +564,9 @@ class ChatViewModel(
                 }
             }
         }
+        viewModelScope.launch {
+            voiceTranscriptEvents.collect(::handleVoiceTranscriptUiEvent)
+        }
         // B7 (Jun 30 2026, kanban t_connection_loading): clear loading state on connection failure or status change
         viewModelScope.launch {
             wsClient.connectionStatus.collect { status ->
@@ -691,6 +702,38 @@ class ChatViewModel(
                 switchSession(initial)
             } else {
                 createNewSession(setLoading = false)
+            }
+        }
+    }
+
+    private fun handleVoiceTranscriptUiEvent(event: VoiceTranscriptUiEvent) {
+        if (
+            event.storedSessionId != _uiState.value.currentSessionId ||
+            event.runtimeSessionId != runtimeSessionId
+        ) {
+            return
+        }
+        when (event) {
+            is VoiceTranscriptUiEvent.Published -> {
+                if (event.text.isBlank() || !optimisticVoiceTranscriptIds.add(event.utteranceId)) return
+                _uiState.update { state ->
+                    state.copy(
+                        messages =
+                            state.messages +
+                                ChatMessage(
+                                    id = event.utteranceId,
+                                    role = MessageRole.USER,
+                                    content = event.text,
+                                ),
+                    )
+                }
+            }
+
+            is VoiceTranscriptUiEvent.SubmissionFailed -> {
+                if (!optimisticVoiceTranscriptIds.remove(event.utteranceId)) return
+                _uiState.update { state ->
+                    state.copy(messages = state.messages.filterNot { it.id == event.utteranceId })
+                }
             }
         }
     }
@@ -852,15 +895,15 @@ class ChatViewModel(
             }
 
             is WsEvent.MessageComplete -> {
-                // Release the process-scoped submission lease for every input
-                // source. The glasses service independently consumes voice
-                event.sessionId?.let { eventSessionId ->
-                    viewModelScope.launch(ioDispatcher) {
-                        ChatTurnCoordinatorProvider
-                            .get()
-                            .completeTerminalForRuntime(eventSessionId, event.text)
+                // A matching glasses turn owns terminal delivery until its
+                // Binder writer has displayed the final response.
+                event.sessionId
+                    ?.takeUnless(::glassesOwnsTerminalDelivery)
+                    ?.let { eventSessionId ->
+                        viewModelScope.launch(ioDispatcher) {
+                            terminalLeaseReleaser(eventSessionId, event.text)
+                        }
                     }
-                }
                 // Buffers cleared before reduce; ViewModel resets them after
                 streamingController.resetStreaming()
             }
@@ -1306,6 +1349,15 @@ class ChatViewModel(
         context.startService(
             Intent(context, MyvuGlassesService::class.java).setAction(MyvuGlassesService.ACTION_STOP),
         )
+    }
+
+    private fun glassesOwnsTerminalDelivery(runtimeSessionId: String): Boolean {
+        val snapshot = GlassesModeControllerProvider.controller.snapshot.value
+        return snapshot.runtimeSessionId == runtimeSessionId &&
+            (
+                snapshot.state == GlassesModeState.AWAITING_HERMES ||
+                    snapshot.state == GlassesModeState.PHONE_PRIORITY
+            )
     }
 
     private fun mirrorAcceptedPhoneInput(

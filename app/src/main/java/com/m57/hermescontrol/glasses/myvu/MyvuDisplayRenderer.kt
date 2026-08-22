@@ -47,8 +47,10 @@ val List<MyvuDisplayCommand>.fontCommand: MyvuDisplayCommand?
 class MyvuDisplayRenderer(
     private val documentId: () -> String = { UUID.randomUUID().toString() },
 ) {
+    private var responsePacingMillis: Int? = null
     private var activeDocumentKey: String? = null
 
+    @Synchronized
     fun commandsFor(
         text: String,
         kind: DisplayKind,
@@ -61,6 +63,9 @@ class MyvuDisplayRenderer(
             } else {
                 checkNotNull(activeDocumentKey)
             }
+        if (kind == DisplayKind.Response) {
+            responsePacingMillis = readability.pacingMillis
+        }
         val openPayload = openApp(text, documentKey, readability.pacingMillis)
         val contentPayload = sendContent(text, documentKey)
         val fontPayload =
@@ -93,6 +98,31 @@ class MyvuDisplayRenderer(
                 payload = fontPayload,
                 documentKey = documentKey,
                 fontMode = readability.fontMode,
+            ),
+        )
+    }
+
+    /**
+     * Replaces the visible text in the active response document by replaying MYVU's
+     * required open-content pair with its existing key and pacing.
+     */
+    @Synchronized
+    fun updateResponse(text: String): List<MyvuDisplayCommand> {
+        require(text.isNotEmpty()) { "Display text cannot be empty" }
+        val documentKey = checkNotNull(activeDocumentKey) { "A response document must be opened first" }
+        val pacingMillis = checkNotNull(responsePacingMillis) { "A response document must be opened first" }
+        return listOf(
+            MyvuDisplayCommand(
+                receiverPackage = MyvuProtocol.LAUNCHER_RECEIVER,
+                senderPackage = PERSONAL_PACKAGE,
+                payload = openApp(text, documentKey, pacingMillis),
+                documentKey = documentKey,
+            ),
+            MyvuDisplayCommand(
+                receiverPackage = MyvuProtocol.LAUNCHER_RECEIVER,
+                senderPackage = PERSONAL_PACKAGE,
+                payload = sendContent(text, documentKey),
+                documentKey = documentKey,
             ),
         )
     }
