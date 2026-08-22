@@ -48,6 +48,28 @@ class MyvuTurnStreamPublisherTest {
         }
 
     @Test
+    fun contentGatedSurfaceAcceptsFirstUpdateAndFinalPublisherSequence() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
+            val surface = ContentGatedSurface()
+            publisher.startEpoch()
+
+            publisher.publishToken("First")
+            runCurrent()
+            publisher.publishToken(" update")
+            advanceTimeBy(200)
+            advanceUntilIdle()
+            publisher.publishFinal("Final")
+            advanceUntilIdle()
+
+            commands.forEach(surface::receive)
+
+            assertEquals(listOf("First", "First update", "Final"), surface.visibleTexts)
+            publisher.close()
+        }
+
+    @Test
     fun finalDropsQueuedPartialAndIsTheLastWrite() =
         runTest {
             val commands = mutableListOf<MyvuDisplayCommand>()
@@ -264,6 +286,30 @@ class MyvuTurnStreamPublisherTest {
                     ).jsonObject
                 inner["sourceText"]!!.jsonPrimitive.content
             }
+
+    private class ContentGatedSurface {
+        private var nextContentDocumentKey: String? = null
+
+        val visibleTexts = mutableListOf<String>()
+
+        fun receive(command: MyvuDisplayCommand) {
+            val data = Json.parseToJsonElement(command.payload).jsonObject["data"]!!.jsonObject
+            when (data["action"]!!.jsonPrimitive.content) {
+                "open_app" -> {
+                    val ext = Json.parseToJsonElement(data["ext"]!!.jsonPrimitive.content).jsonObject
+                    nextContentDocumentKey = ext["fileKey"]!!.jsonPrimitive.content
+                }
+
+                "send_content" -> {
+                    val content = Json.parseToJsonElement(data["value"]!!.jsonPrimitive.content).jsonObject
+                    if (content["fileKey"]!!.jsonPrimitive.content == nextContentDocumentKey) {
+                        nextContentDocumentKey = null
+                        visibleTexts += content["sourceText"]!!.jsonPrimitive.content
+                    }
+                }
+            }
+        }
+    }
 
     private class BlockingWriterDispatcher : CoroutineDispatcher() {
         private val tasks = ArrayDeque<Runnable>()

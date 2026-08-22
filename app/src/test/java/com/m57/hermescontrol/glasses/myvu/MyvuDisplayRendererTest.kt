@@ -62,14 +62,41 @@ class MyvuDisplayRendererTest {
     }
 
     @Test
-    fun responseUpdateSendsOnlyContentToTheActiveDocument() {
+    fun responseUpdateReopensActiveDocumentThenSendsContentWithoutChangingFont() {
         val renderer = MyvuDisplayRenderer(documentId = { "doc" })
-        val opened = renderer.commandsFor("Partial", DisplayKind.Response)
+        val opened =
+            renderer.commandsFor(
+                text = "Partial",
+                kind = DisplayKind.Response,
+                readability = GlassesReadability(fontMode = GlassesFontMode.Large, pacingMillis = 450),
+            )
+        renderer.commandsFor(
+            text = "Working",
+            kind = DisplayKind.Status,
+            readability = GlassesReadability(pacingMillis = 200),
+        )
 
         val update = renderer.updateResponse("Partial answer")
 
-        assertEquals(1, update.size)
-        assertEquals(opened.single { it.payload.contains("send_content") }.documentKey, update.single().documentKey)
-        assertTrue(update.single().payload.contains("Partial answer"))
+        assertEquals(2, update.size)
+        assertEquals(opened[0].documentKey, update[0].documentKey)
+        assertEquals(update[0].documentKey, update[1].documentKey)
+        assertEquals(
+            "open_app",
+            Json.parseToJsonElement(update[0].payload).jsonObject["data"]!!.jsonObject["action"]
+                .toString()
+                .trim('"'),
+        )
+        assertEquals(
+            "send_content",
+            Json.parseToJsonElement(update[1].payload).jsonObject["data"]!!.jsonObject["action"]
+                .toString()
+                .trim('"'),
+        )
+        assertTrue(update[0].payload.contains("\\\"fileKey\\\":\\\"doc/hermes-agent\\\""))
+        assertTrue(update[0].payload.contains("\\\"ticiSpeed\\\":450"))
+        assertTrue(update[1].payload.contains("\\\"fileKey\\\":\\\"doc/hermes-agent\\\""))
+        assertTrue(update[1].payload.contains("Partial answer"))
+        assertTrue(update.none { it.fontMode != null })
     }
 }
