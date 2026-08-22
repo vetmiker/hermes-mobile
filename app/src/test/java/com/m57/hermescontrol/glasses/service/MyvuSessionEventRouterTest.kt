@@ -34,7 +34,7 @@ class MyvuSessionEventRouterTest {
         router.route(WsEvent.MessageComplete("Final", "runtime"))
         router.route(WsEvent.MessageToken("late", "runtime"))
 
-        assertEquals(listOf("start", "token:Hello", "tool:read_file", "final:Final"), publisher.calls)
+        assertEquals(listOf("start", "token:Hello", "tool:start:read_file", "final:Final"), publisher.calls)
         assertEquals(listOf("Final"), completed)
     }
 
@@ -69,6 +69,78 @@ class MyvuSessionEventRouterTest {
         router.route(WsEvent.MessageStart("runtime"))
         snapshot = snapshot.copy(generation = snapshot.generation + 1)
         router.route(WsEvent.MessageToken("stale", "runtime"))
+
+        assertEquals(listOf("start"), publisher.calls)
+    }
+
+    @Test
+    fun routesNullSessionFollowUpsThroughTheOpenEpochAndClosesAfterFinal() {
+        val publisher = FakePublisher()
+        val completed = mutableListOf<String>()
+        val router = MyvuSessionEventRouter(publisher, ::activeSnapshot) { _, text -> completed += text }
+
+        router.route(WsEvent.MessageStart("runtime"))
+        router.route(WsEvent.ToolStart("read_file", mapOf("path" to "/tmp/x")))
+        router.route(WsEvent.ToolGenerating("read_file"))
+        router.route(WsEvent.ToolProgress("read_file", "Reading"))
+        router.route(WsEvent.ToolComplete("read_file", emptyMap()))
+        router.route(WsEvent.MessageToken("Hello", null))
+        router.route(WsEvent.MessageComplete("Final", null))
+        router.route(WsEvent.MessageToken("late", null))
+
+        assertEquals(
+            listOf(
+                "start",
+                "tool:start:read_file",
+                "tool:generating:read_file",
+                "tool:progress:read_file:Reading",
+                "tool:complete:read_file",
+                "token:Hello",
+                "final:Final",
+            ),
+            publisher.calls,
+        )
+        assertEquals(listOf("Final"), completed)
+    }
+
+    @Test
+    fun closeIsTerminalForExactStartsAndNullSessionFollowUps() {
+        val publisher = FakePublisher()
+        val completed = mutableListOf<String>()
+        val router = MyvuSessionEventRouter(publisher, ::activeSnapshot) { _, text -> completed += text }
+
+        router.route(WsEvent.MessageStart("runtime"))
+        router.route(WsEvent.MessageToken("before-close", null))
+        router.close()
+        router.close()
+        router.route(WsEvent.MessageStart("runtime"))
+        router.route(WsEvent.ToolStart("read_file", null))
+        router.route(WsEvent.MessageToken("after-close", null))
+        router.route(WsEvent.MessageComplete("after-close", null))
+
+        assertEquals(
+            listOf(
+                "start",
+                "token:before-close",
+                "close",
+            ),
+            publisher.calls,
+        )
+        assertTrue(completed.isEmpty())
+    }
+
+    @Test
+    fun fencesConflictingSessionEventsAndNullEventsBeforeMessageStart() {
+        val publisher = FakePublisher()
+        val router = MyvuSessionEventRouter(publisher, ::activeSnapshot) { _, _ -> }
+
+        router.route(WsEvent.ToolStart("before-start", null))
+        router.route(WsEvent.MessageToken("before-start", null))
+        router.route(WsEvent.MessageComplete("before-start", null))
+        router.route(WsEvent.MessageStart("runtime"))
+        router.route(WsEvent.ToolStart("other", null, "other"))
+        router.route(WsEvent.MessageToken("other", "other"))
+        router.route(WsEvent.MessageComplete("other", "other"))
 
         assertEquals(listOf("start"), publisher.calls)
     }
@@ -200,17 +272,23 @@ class MyvuSessionEventRouterTest {
             name: String?,
             data: Map<String, Any?>?,
         ) {
-            calls += "tool:$name"
+            calls += "tool:start:$name"
         }
 
-        override fun publishToolGenerating(name: String?) = Unit
+        override fun publishToolGenerating(name: String?) {
+            calls += "tool:generating:$name"
+        }
 
         override fun publishToolProgress(
             name: String?,
             preview: String?,
-        ) = Unit
+        ) {
+            calls += "tool:progress:$name:$preview"
+        }
 
-        override fun publishToolComplete(name: String?) = Unit
+        override fun publishToolComplete(name: String?) {
+            calls += "tool:complete:$name"
+        }
 
         override fun publishToolRisk(name: String?) = Unit
 
@@ -222,6 +300,8 @@ class MyvuSessionEventRouterTest {
             afterDelivery?.invoke()
         }
 
-        override fun close() = Unit
+        override fun close() {
+            calls += "close"
+        }
     }
 }

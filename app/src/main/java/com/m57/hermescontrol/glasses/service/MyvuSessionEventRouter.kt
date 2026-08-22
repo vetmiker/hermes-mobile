@@ -7,9 +7,9 @@ import com.m57.hermescontrol.glasses.GlassesModeState
 /**
  * Fences the gateway's ordered same-socket stream to one glasses turn.
  *
- * Token and tool events have no server turn ID, so MessageStart opens the only
- * accepted epoch and every later event must match its session and controller
- * generation. The service owns lifecycle effects; this router only decides
+ * MessageStart must name the active server session to open an epoch. Later
+ * token and tool events may omit that ID, but any supplied ID and the controller
+ * generation must match the open epoch. The service owns lifecycle effects; this router only decides
  * which projection calls are valid.
  */
 internal class MyvuSessionEventRouter(
@@ -17,9 +17,12 @@ internal class MyvuSessionEventRouter(
     private val currentSnapshot: () -> GlassesModeSnapshot,
     private val onFinalDelivered: (GlassesModeSnapshot, String) -> Unit,
 ) {
+    private var closed = false
     private var epoch: Epoch? = null
 
+    @Synchronized
     fun route(event: WsEvent) {
+        if (closed) return
         val snapshot = currentSnapshot()
         when (event) {
             is WsEvent.MessageStart -> {
@@ -62,7 +65,10 @@ internal class MyvuSessionEventRouter(
         }
     }
 
+    @Synchronized
     fun close() {
+        if (closed) return
+        closed = true
         epoch = null
         publisher.close()
     }
@@ -72,21 +78,25 @@ internal class MyvuSessionEventRouter(
         eventSessionId: String?,
     ): Boolean {
         val activeEpoch = epoch ?: return false
-        return isEligible(snapshot, eventSessionId) &&
+        return isActive(snapshot) &&
             activeEpoch.generation == snapshot.generation &&
-            activeEpoch.runtimeSessionId == snapshot.runtimeSessionId
+            activeEpoch.runtimeSessionId == snapshot.runtimeSessionId &&
+            (eventSessionId == null || activeEpoch.runtimeSessionId == eventSessionId)
     }
+
+    private fun isActive(snapshot: GlassesModeSnapshot): Boolean =
+        !snapshot.runtimeSessionId.isNullOrBlank() &&
+            (
+                snapshot.state == GlassesModeState.AWAITING_HERMES ||
+                    snapshot.state == GlassesModeState.PHONE_PRIORITY
+            )
 
     private fun isEligible(
         snapshot: GlassesModeSnapshot,
         eventSessionId: String?,
     ): Boolean =
-        !snapshot.runtimeSessionId.isNullOrBlank() &&
-            snapshot.runtimeSessionId == eventSessionId &&
-            (
-                snapshot.state == GlassesModeState.AWAITING_HERMES ||
-                    snapshot.state == GlassesModeState.PHONE_PRIORITY
-            )
+        isActive(snapshot) &&
+            snapshot.runtimeSessionId == eventSessionId
 
     private data class Epoch(
         val generation: Long,
