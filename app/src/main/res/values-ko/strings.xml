@@ -410,7 +410,7 @@
     <string name="profiles_action_auto_describe">자동 설명</string>
     <string name="profiles_action_setup_command">설정 명령</string>
     <string name="profiles_action_copy">복사</string>
-    <string name="profiles_action_copied">복사됨 ✓</string>
+    <string name="profiles_action_copied">복사됨</string>
     <string name="profiles_title_rename">프로필 이름 변경: %1$s</string>
     <string name="profiles_title_delete">프로필 삭제: %1$s</string>
     <string name="profiles_title_setup_command">설정 명령: %1$s</string>
@@ -751,4 +751,12 @@
     <string name="timeline_marker_skill_invocation">스킬 호출됨</string>
     <string name="timeline_marker_internal_notification">시스템 알림</string>
     <string name="timeline_marker_max_iterations">도구 호출 한도 도달</string>
+    <string name="task_progress_count">작업 %1$d/%2$d</string>
+    <plurals name="task_progress_agents">
+        <item quantity="other">에이전트 %1$d개</item>
+    </plurals>
+    <plurals name="task_progress_agent_running">
+        <item quantity="other">에이전트 %1$d개 실행 중</item>
+    </plurals>
+    <string name="task_progress_open_details">작업 세부 정보 열기</string>
 </resources>

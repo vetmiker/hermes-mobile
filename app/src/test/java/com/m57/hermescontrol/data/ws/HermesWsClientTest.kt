@@ -1419,4 +1419,93 @@ class HermesWsClientTest {
 
         assertEquals(ConnectionStatus.RECONNECTING, HermesWsClient.connectionStatus.value)
     }
+
+    @Test
+    fun testGatedMode_parsesEscapedTicketFromRealJsonShape() {
+        every { AuthManager.isAutoReconnect() } returns true
+        every { AuthManager.serverStore } returns
+            mockk<com.m57.hermescontrol.data.config.ServerStore>().also {
+                every { it.getLatestState() } returns
+                    com.m57.hermescontrol.data.config
+                        .ServerStoreState(wsAuthParam = "ticket")
+            }
+        every { AuthManager.setToken(any()) } returns Unit
+
+        val ticketServer = MockWebServer()
+        ticketServer.start()
+        // Real backend shape with an ESCAPED QUOTE inside the ticket value.
+        // Built from char vals so nobody has to count backslashes again:
+        //   wire body == {"ticket":"a<backslash><dquote>y","ttl_seconds":30}
+        // The old regex ([^"]+) stops at the inner dquote and extracts "a<bs>",
+        // which never equals the real ticket — only the JSON parser survives.
+        val bs = 92.toChar() // backslash
+        val dq = 34.toChar() // dquote
+        val wireTicket = "a" + bs + dq + "y"
+
+        fun jsonEscape(s: String): String = s.replace("$bs", "$bs$bs").replace("$dq", "$bs$dq")
+        val wireBody = """{"ticket":"${jsonEscape(wireTicket)}","ttl_seconds":30}"""
+        ticketServer.enqueue(MockResponse().setResponseCode(200).setBody(wireBody))
+        every { AuthManager.endpointForBuild() } returns
+            ServerEndpoint.parse(
+                ticketServer.url("/").toString(),
+                CleartextPolicy.ALLOW_WITH_WARNING,
+            )
+
+        HermesWsClient.connect()
+
+        io.mockk.verify(timeout = 5000) { AuthManager.setToken(wireTicket) }
+        ticketServer.shutdown()
+    }
+
+    @Test
+    fun testStaleSocketIsCancelledByWatchdog() {
+        var serverWebSocket: WebSocket? = null
+        val serverLatch = CountDownLatch(1)
+        mockWebServer.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onOpen(
+                        webSocket: WebSocket,
+                        response: okhttp3.Response,
+                    ) {
+                        serverWebSocket = webSocket
+                        serverLatch.countDown()
+                    }
+
+                    override fun onMessage(
+                        webSocket: WebSocket,
+                        text: String,
+                    ) {
+                        // Any inbound frame refreshes liveness — send nothing,
+                        // simulating a dead NAT'd link where only client pings flow.
+                    }
+                },
+            ),
+        )
+
+        HermesWsClient.connect()
+        runBlocking {
+            withTimeout(5000) {
+                HermesWsClient.connectionStatus.first { it == ConnectionStatus.CONNECTED }
+            }
+        }
+        assertTrue(serverLatch.await(5, TimeUnit.SECONDS))
+        assertTrue(HermesWsClient.isConnected)
+
+        // Backdate liveness past the staleness threshold, then force one
+        // synchronous watchdog pass. Deterministic — no real-time waiting.
+        HermesWsClient.forceHealthCheckForTest(staleMillis = 200_000L)
+
+        // Cancel fires onFailure on an OkHttp thread; with auto-reconnect off
+        // (setUp default) the terminal state settles at DISCONNECTED.
+        val deadline = System.currentTimeMillis() + 5000
+        while (HermesWsClient.isConnected && System.currentTimeMillis() < deadline) {
+            Thread.sleep(25)
+        }
+        assertFalse("Stale socket was not cancelled", HermesWsClient.isConnected)
+        assertTrue(
+            "Status stuck at CONNECTED after stale cancel",
+            HermesWsClient.connectionStatus.value != ConnectionStatus.CONNECTED,
+        )
+    }
 }

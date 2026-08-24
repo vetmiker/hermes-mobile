@@ -553,7 +553,7 @@
     <string name="profiles_action_auto_describe">自动描述</string>
     <string name="profiles_action_setup_command">安装命令</string>
     <string name="profiles_action_copy">复制</string>
-    <string name="profiles_action_copied">已复制 ✓</string>
+    <string name="profiles_action_copied">已复制</string>
     <string name="profiles_title_rename">重命名配置：%1$s</string>
     <string name="profiles_title_delete">删除配置：%1$s</string>
     <string name="profiles_title_setup_command">安装命令：%1$s</string>
@@ -1036,7 +1036,14 @@
     <string name="tg_onboarding_saving">正在保存配置…</string>
     <string name="tg_onboarding_scan_hint">打开 Telegram 扫描应用内显示的二维码。</string>
     <string name="tg_onboarding_user_id_placeholder">Telegram 用户 ID</string>
-    <string name="todo_task_count">任务 %1$d/%2$d</string>
+    <string name="task_progress_count">任务 %1$d/%2$d</string>
+    <plurals name="task_progress_agents">
+        <item quantity="other">%1$d 个代理</item>
+    </plurals>
+    <plurals name="task_progress_agent_running">
+        <item quantity="other">%1$d 个代理运行中</item>
+    </plurals>
+    <string name="task_progress_open_details">查看任务详情</string>
     <string name="tool_duration">耗时：%1$s</string>
     <string name="tool_redacted">· 已脱敏</string>
     <string name="toolsets_search_placeholder">搜索工具集…</string>

@@ -89,6 +89,8 @@ fun ChatInputBar(
     reasoningLevel: String? = null,
     onModelTap: () -> Unit = {},
     onReasoningTap: (String?) -> Unit = {},
+    canDisableReasoning: Boolean? = null,
+    supportsReasoning: Boolean? = null,
 ) {
     // Allow sending while the agent is mid-turn or awaiting approval: the
     // gateway's prompt.submit busy-input policy queues it as the next turn
@@ -276,9 +278,12 @@ fun ChatInputBar(
                                         innerTextField()
                                     }
 
-                                    // Send button INSIDE the field
+                                    // Send button INSIDE the field. Shown whenever a send is
+                                    // possible — text typed OR an attachment pending (issue
+                                    // #956): the old text-only gate hid the button entirely
+                                    // for attachment-only sends.
                                     AnimatedContent(
-                                        targetState = canSend && inputFieldValue.text.isNotBlank(),
+                                        targetState = canSend,
                                         transitionSpec = {
                                             (scaleIn(initialScale = 0.8f) + fadeIn())
                                                 .togetherWith(scaleOut(targetScale = 0.8f) + fadeOut())
@@ -319,6 +324,8 @@ fun ChatInputBar(
                     onReasoningSelected = onReasoningTap,
                     onMicTap = onMicTap,
                     modifier = Modifier.testTag("chat_composer_toolbar"),
+                    canDisableReasoning = canDisableReasoning,
+                    supportsReasoning = supportsReasoning,
                 )
 
                 // Attachment dropdown (anchored to the attach button in ComposerToolbar)
