@@ -1,6 +1,7 @@
 package com.m57.hermescontrol.glasses.service
 
 import com.m57.hermescontrol.glasses.myvu.DisplayKind
+import com.m57.hermescontrol.glasses.myvu.GlassesFontMode
 import com.m57.hermescontrol.glasses.myvu.GlassesReadability
 import com.m57.hermescontrol.glasses.myvu.MyvuDisplayCommand
 import com.m57.hermescontrol.glasses.myvu.MyvuDisplayRenderer
@@ -49,6 +50,105 @@ internal interface MyvuTurnPublisher {
 }
 
 /**
+ * Conservative ED70 teleprompter geometry used to decide when a refreshed
+ * response needs a new document identity to start MYVU scrolling.
+ *
+ * The device exposes no page-overflow signal. These named estimates deliberately
+ * leave a one-wrapped-line margin after the visible page and are the single place
+ * to calibrate after device observations.
+ */
+internal object MyvuResponsePageLayout {
+    const val OVERFLOW_MARGIN_LINES = 1
+
+    // ED70 teleprompter estimates: 640 px-wide display at the two vendor font modes.
+    private const val ED70_STANDARD_COLUMNS_PER_LINE = 30
+    private const val ED70_STANDARD_VISIBLE_LINES = 11
+    private const val ED70_LARGE_COLUMNS_PER_LINE = 22
+    private const val ED70_LARGE_VISIBLE_LINES = 8
+
+    fun pagePlusOneLineCapacity(fontMode: GlassesFontMode): Int =
+        geometryFor(fontMode).visibleLines + OVERFLOW_MARGIN_LINES
+
+    fun columnsPerLine(fontMode: GlassesFontMode): Int = geometryFor(fontMode).columnsPerLine
+
+    fun isBeyondOverflowMargin(
+        text: CharSequence,
+        fontMode: GlassesFontMode,
+    ): Boolean = estimatedWrappedLines(text, fontMode) >= pagePlusOneLineCapacity(fontMode)
+
+    fun estimatedWrappedLines(
+        text: CharSequence,
+        fontMode: GlassesFontMode,
+    ): Int {
+        val geometry = geometryFor(fontMode)
+        var lines = 0
+        var lineStart = 0
+        for (index in 0..text.length) {
+            if (index == text.length || text[index] == '\n') {
+                lines += wrappedLines(text, lineStart, index, geometry)
+                lineStart = index + 1
+            }
+        }
+        return lines
+    }
+
+    private fun geometryFor(fontMode: GlassesFontMode): PageGeometry =
+        when (fontMode) {
+            GlassesFontMode.Standard ->
+                PageGeometry(
+                    columnsPerLine = ED70_STANDARD_COLUMNS_PER_LINE,
+                    visibleLines = ED70_STANDARD_VISIBLE_LINES,
+                )
+            GlassesFontMode.Large ->
+                PageGeometry(
+                    columnsPerLine = ED70_LARGE_COLUMNS_PER_LINE,
+                    visibleLines = ED70_LARGE_VISIBLE_LINES,
+                )
+        }
+
+    private fun wrappedLines(
+        text: CharSequence,
+        startIndex: Int,
+        endIndex: Int,
+        geometry: PageGeometry,
+    ): Int {
+        if (startIndex == endIndex) return 1
+
+        var lines = 1
+        var column = 0
+        var index = startIndex
+        while (index < endIndex) {
+            if (text[index].isWhitespace()) {
+                if (column == geometry.columnsPerLine) {
+                    lines += 1
+                    column = 0
+                }
+                column += 1
+                index += 1
+                continue
+            }
+
+            val wordStart = index
+            while (index < endIndex && !text[index].isWhitespace()) index += 1
+            val wordLength = index - wordStart
+            if (column > 0 && column + wordLength > geometry.columnsPerLine) {
+                lines += 1
+                column = 0
+            }
+            val occupiedLines = (wordLength - 1) / geometry.columnsPerLine
+            lines += occupiedLines
+            column = ((wordLength - 1) % geometry.columnsPerLine) + 1
+        }
+        return lines
+    }
+
+    private data class PageGeometry(
+        val columnsPerLine: Int,
+        val visibleLines: Int,
+    )
+}
+
+/**
  * Session-local, ordered projection of one assistant response onto MYVU.
  *
  * Event callbacks only update the projection and queue immutable work. Binder
@@ -61,12 +161,17 @@ internal class MyvuTurnStreamPublisher(
     private val writer: MyvuCommandWriter,
     writerDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : MyvuTurnPublisher {
+    private enum class DocumentPhase {
+        Initial,
+        Scrolling,
+    }
+
     private data class RenderIntent(
         val generation: Long,
         val text: String,
+        val documentPhase: DocumentPhase,
         val isPartial: Boolean = false,
         val isFinal: Boolean = false,
-        val forceNewDocument: Boolean = false,
         val afterDelivery: (() -> Unit)? = null,
     )
 
@@ -77,6 +182,7 @@ internal class MyvuTurnStreamPublisher(
     private var generation = 0L
     private var epochOpen = false
     private var finalQueued = false
+    private var scrollingRekeyRequested = false
     private val assistantText = StringBuilder()
     private var toolLine: String? = null
     private var projectionQueued = false
@@ -85,6 +191,7 @@ internal class MyvuTurnStreamPublisher(
     init {
         writerScope.launch {
             var openedGeneration: Long? = null
+            var openedDocumentPhase: DocumentPhase? = null
             for (ignored in writerWakeups) {
                 while (true) {
                     val intent =
@@ -97,7 +204,8 @@ internal class MyvuTurnStreamPublisher(
                         }
                     if (!shouldRender) continue
 
-                    val opensDocument = openedGeneration != intent.generation || intent.forceNewDocument
+                    val opensDocument =
+                        openedGeneration != intent.generation || openedDocumentPhase != intent.documentPhase
                     val commands =
                         if (opensDocument) {
                             renderer.commandsFor(intent.text, DisplayKind.Response, readability())
@@ -112,7 +220,10 @@ internal class MyvuTurnStreamPublisher(
                         }
                         writer.send(command)
                     }
-                    if (opensDocument && deliveredWholeSequence) openedGeneration = intent.generation
+                    if (opensDocument && deliveredWholeSequence) {
+                        openedGeneration = intent.generation
+                        openedDocumentPhase = intent.documentPhase
+                    }
 
                     val shouldDeliverFinal =
                         intent.isFinal &&
@@ -129,6 +240,7 @@ internal class MyvuTurnStreamPublisher(
             generation += 1
             epochOpen = true
             finalQueued = false
+            scrollingRekeyRequested = false
             assistantText.clear()
             toolLine = null
             projectionQueued = false
@@ -143,7 +255,12 @@ internal class MyvuTurnStreamPublisher(
             if (!epochOpen || finalQueued) return
             assistantText.append(token)
             toolLine = null
-            if (!projectionQueued) {
+            if (crossesOverflowMarginLocked()) {
+                scrollingRekeyRequested = true
+                cancelPendingPartialLocked()
+                intents.clear()
+                enqueueCurrentLocked()
+            } else if (!projectionQueued) {
                 enqueuePartialLocked()
                 projectionQueued = true
             } else {
@@ -192,8 +309,14 @@ internal class MyvuTurnStreamPublisher(
         synchronized(stateLock) {
             if (!epochOpen || finalQueued) return
             finalQueued = true
-            intents.removeAll { it.isPartial }
-            enqueueLocked(text, isFinal = true, forceNewDocument = true, afterDelivery = afterDelivery)
+            if (projectedTextLocked() != null && crossesOverflowMarginLocked(text)) {
+                scrollingRekeyRequested = true
+                cancelPendingPartialLocked()
+                intents.clear()
+            } else {
+                intents.removeAll { it.isPartial }
+            }
+            enqueueLocked(text, isFinal = true, afterDelivery = afterDelivery)
         }
     }
 
@@ -249,6 +372,13 @@ internal class MyvuTurnStreamPublisher(
             }
     }
 
+    private fun crossesOverflowMarginLocked(text: CharSequence = assistantText): Boolean =
+        !scrollingRekeyRequested &&
+            MyvuResponsePageLayout.isBeyondOverflowMargin(text, readability().fontMode)
+
+    private fun documentPhaseLocked(): DocumentPhase =
+        if (scrollingRekeyRequested) DocumentPhase.Scrolling else DocumentPhase.Initial
+
     private fun enqueueCurrentLocked() {
         projectedTextLocked()?.let { enqueueLocked(it) }
     }
@@ -256,23 +386,29 @@ internal class MyvuTurnStreamPublisher(
     private fun enqueuePartialLocked() {
         val text = projectedTextLocked() ?: return
         intents.removeAll { it.isPartial }
-        intents.addLast(RenderIntent(generation, text, isPartial = true))
+        intents.addLast(
+            RenderIntent(
+                generation = generation,
+                text = text,
+                documentPhase = documentPhaseLocked(),
+                isPartial = true,
+            ),
+        )
         writerWakeups.trySend(Unit)
     }
 
     private fun enqueueLocked(
         text: String,
         isFinal: Boolean = false,
-        forceNewDocument: Boolean = false,
         afterDelivery: (() -> Unit)? = null,
     ) {
         if (isFinal || intents.count { !it.isPartial } < MAX_PENDING_CONTROL_INTENTS) {
             intents.addLast(
                 RenderIntent(
-                    generation,
-                    text,
+                    generation = generation,
+                    text = text,
+                    documentPhase = documentPhaseLocked(),
                     isFinal = isFinal,
-                    forceNewDocument = forceNewDocument,
                     afterDelivery = afterDelivery,
                 ),
             )
@@ -295,8 +431,7 @@ internal class MyvuTurnStreamPublisher(
         val config = ToolSchemaRegistry.getDisplayConfig(name)
         val detail = safeDetail(name, data)
         return buildString {
-            append(config.iconEmoji)
-            append(' ')
+            append(config.summaryPrefix.ifBlank { "• " })
             append(config.name)
             if (detail != null) {
                 append(": ")
