@@ -6,11 +6,21 @@ import org.junit.Test
 
 class GlassesInitialDisplayTest {
     @Test
-    fun rejects_no_completed_turn_or_typing_state() {
+    fun returns_neutral_display_for_an_empty_session() {
+        assertEquals("Hermes is ready.", initialGlassesDisplay(emptyList()))
+    }
+
+    @Test
+    fun rejects_prompt_only_and_incomplete_states() {
         val prompt = message("prompt", MessageRole.USER, "Draft a release note")
 
-        assertNull(initialGlassesDisplay(emptyList()))
         assertNull(initialGlassesDisplay(listOf(prompt)))
+        assertNull(
+            initialGlassesDisplay(
+                messages = emptyList(),
+                streamingMessage = message("stream", MessageRole.ASSISTANT, "Working", isStreaming = true),
+            ),
+        )
         assertNull(
             initialGlassesDisplay(
                 messages = listOf(prompt, message("partial", MessageRole.ASSISTANT, "Working", isStreaming = true)),

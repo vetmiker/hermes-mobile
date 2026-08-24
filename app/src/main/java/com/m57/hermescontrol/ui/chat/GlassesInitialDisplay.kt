@@ -4,6 +4,8 @@ import com.m57.hermescontrol.ui.chat.fullbleed.AgentEntry
 import com.m57.hermescontrol.ui.chat.fullbleed.ChatTurn
 import com.m57.hermescontrol.ui.chat.fullbleed.groupIntoTurns
 
+private const val EMPTY_SESSION_DISPLAY = "Hermes is ready."
+
 /**
  * Produces the immutable context shown when a chat is handed to the glasses.
  *
@@ -18,6 +20,7 @@ internal fun initialGlassesDisplay(
     streamingMessage: ChatMessage? = null,
 ): String? {
     if (isAgentTyping || streamingMessage != null) return null
+    if (messages.isEmpty()) return EMPTY_SESSION_DISPLAY
 
     val turns = groupIntoTurns(messages)
     val userTurnIndex = turns.indexOfLast { it is ChatTurn.User }
