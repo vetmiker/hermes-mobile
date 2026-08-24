@@ -70,6 +70,112 @@ class MyvuTurnStreamPublisherTest {
         }
 
     @Test
+    fun closeDuringFinalDocumentDeliveryStopsRemainingCommandsAndCallback() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val delivered = AtomicInteger()
+            lateinit var publisher: MyvuTurnStreamPublisher
+            publisher =
+                MyvuTurnStreamPublisher(
+                    renderer = MyvuDisplayRenderer(documentId = { "document" }),
+                    readability = { GlassesReadability() },
+                    writer =
+                        MyvuCommandWriter { command ->
+                            commands += command
+                            if (commandActions(listOf(command)) == listOf("open_app")) publisher.close()
+                        },
+                    writerDispatcher = StandardTestDispatcher(testScheduler),
+                )
+            publisher.startEpoch()
+
+            publisher.publishFinal("Final") { delivered.incrementAndGet() }
+            advanceUntilIdle()
+
+            assertEquals(listOf("open_app"), commandActions(commands))
+            assertEquals(0, delivered.get())
+        }
+
+    @Test
+    fun newEpochDuringFinalDocumentDeliveryStopsRemainingCommandsAndCallback() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val delivered = AtomicInteger()
+            lateinit var publisher: MyvuTurnStreamPublisher
+            publisher =
+                MyvuTurnStreamPublisher(
+                    renderer = MyvuDisplayRenderer(documentId = { "document" }),
+                    readability = { GlassesReadability() },
+                    writer =
+                        MyvuCommandWriter { command ->
+                            commands += command
+                            if (commandActions(listOf(command)) == listOf("open_app")) publisher.startEpoch()
+                        },
+                    writerDispatcher = StandardTestDispatcher(testScheduler),
+                )
+            publisher.startEpoch()
+
+            publisher.publishFinal("Final") { delivered.incrementAndGet() }
+            advanceUntilIdle()
+
+            assertEquals(listOf("open_app"), commandActions(commands))
+            assertEquals(0, delivered.get())
+            publisher.close()
+        }
+
+    @Test
+    fun finalAfterToolAndPartialMintsFreshDocumentBeforeDeliveryCallback() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val documentIds = AtomicInteger()
+            val publisher =
+                MyvuTurnStreamPublisher(
+                    renderer = MyvuDisplayRenderer(documentId = { "document-${documentIds.incrementAndGet()}" }),
+                    readability = { GlassesReadability() },
+                    writer = MyvuCommandWriter { commands += it },
+                    writerDispatcher = StandardTestDispatcher(testScheduler),
+                )
+            var actionsAtDelivery: List<String>? = null
+            publisher.startEpoch()
+
+            publisher.publishToolStart("read_file", mapOf("path" to "/tmp/x"))
+            advanceUntilIdle()
+            publisher.publishToken("Partial")
+            advanceUntilIdle()
+            publisher.publishFinal("Final") { actionsAtDelivery = commandActions(commands) }
+            advanceUntilIdle()
+
+            val transientCommands = commands.take(5)
+            val finalCommands = commands.takeLast(3)
+            assertEquals(1, transientCommands.map { it.documentKey }.distinct().size)
+            assertEquals(
+                listOf("open_app", "send_content", "set_font_mode", "open_app", "send_content"),
+                commandActions(transientCommands),
+            )
+            assertEquals(1, finalCommands.map { it.documentKey }.distinct().size)
+            assertFalse(transientCommands.first().documentKey == finalCommands.first().documentKey)
+            assertEquals(listOf("open_app", "send_content", "set_font_mode"), commandActions(finalCommands))
+            assertEquals(commandActions(commands), actionsAtDelivery)
+            assertEquals("Final", visibleTexts(commands).last())
+            publisher.close()
+        }
+
+    @Test
+    fun completeOnlyFinalOpensOneResponseDocument() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
+            publisher.startEpoch()
+
+            publisher.publishFinal("Complete")
+            advanceUntilIdle()
+
+            assertEquals(listOf("open_app", "send_content", "set_font_mode"), commandActions(commands))
+            assertEquals(1, commands.map { it.documentKey }.distinct().size)
+            assertEquals(listOf("Complete"), visibleTexts(commands))
+            publisher.close()
+        }
+
+    @Test
     fun finalDropsQueuedPartialAndIsTheLastWrite() =
         runTest {
             val commands = mutableListOf<MyvuDisplayCommand>()
@@ -246,9 +352,9 @@ class MyvuTurnStreamPublisherTest {
         val intentClass = publisherClass.declaredClasses.single { it.simpleName == "RenderIntent" }
         val staleIntent =
             intentClass.declaredConstructors
-                .single { it.parameterTypes.size == 5 }
+                .single { it.parameterTypes.size == 6 }
                 .apply { isAccessible = true }
-                .newInstance(generation - 1, text, false, false, null)
+                .newInstance(generation - 1, text, false, false, false, null)
         val intents =
             publisherClass
                 .getDeclaredField("intents")
@@ -286,6 +392,15 @@ class MyvuTurnStreamPublisherTest {
                     ).jsonObject
                 inner["sourceText"]!!.jsonPrimitive.content
             }
+
+    private fun commandActions(commands: List<MyvuDisplayCommand>): List<String> =
+        commands.map { command ->
+            Json
+                .parseToJsonElement(command.payload)
+                .jsonObject["data"]!!
+                .jsonObject["action"]!!
+                .jsonPrimitive.content
+        }
 
     private class ContentGatedSurface {
         private var nextContentDocumentKey: String? = null

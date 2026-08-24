@@ -66,6 +66,7 @@ internal class MyvuTurnStreamPublisher(
         val text: String,
         val isPartial: Boolean = false,
         val isFinal: Boolean = false,
+        val forceNewDocument: Boolean = false,
         val afterDelivery: (() -> Unit)? = null,
     )
 
@@ -96,21 +97,27 @@ internal class MyvuTurnStreamPublisher(
                         }
                     if (!shouldRender) continue
 
-                    val opensDocument = openedGeneration != intent.generation
+                    val opensDocument = openedGeneration != intent.generation || intent.forceNewDocument
                     val commands =
                         if (opensDocument) {
                             renderer.commandsFor(intent.text, DisplayKind.Response, readability())
                         } else {
                             renderer.updateResponse(intent.text)
                         }
-                    commands.forEach(writer::send)
-                    if (opensDocument) openedGeneration = intent.generation
+                    var deliveredWholeSequence = true
+                    for (command in commands) {
+                        if (!isCurrentIntent(intent)) {
+                            deliveredWholeSequence = false
+                            break
+                        }
+                        writer.send(command)
+                    }
+                    if (opensDocument && deliveredWholeSequence) openedGeneration = intent.generation
 
                     val shouldDeliverFinal =
                         intent.isFinal &&
-                            synchronized(stateLock) {
-                                intent.generation == generation && epochOpen
-                            }
+                            deliveredWholeSequence &&
+                            isCurrentIntent(intent)
                     if (shouldDeliverFinal) intent.afterDelivery?.invoke()
                 }
             }
@@ -186,7 +193,7 @@ internal class MyvuTurnStreamPublisher(
             if (!epochOpen || finalQueued) return
             finalQueued = true
             intents.removeAll { it.isPartial }
-            enqueueLocked(text, isFinal = true, afterDelivery = afterDelivery)
+            enqueueLocked(text, isFinal = true, forceNewDocument = true, afterDelivery = afterDelivery)
         }
     }
 
@@ -199,6 +206,11 @@ internal class MyvuTurnStreamPublisher(
         }
         writerScope.cancel()
     }
+
+    private fun isCurrentIntent(intent: RenderIntent): Boolean =
+        synchronized(stateLock) {
+            intent.generation == generation && epochOpen
+        }
 
     private fun publishToolStatus(
         name: String?,
@@ -251,10 +263,19 @@ internal class MyvuTurnStreamPublisher(
     private fun enqueueLocked(
         text: String,
         isFinal: Boolean = false,
+        forceNewDocument: Boolean = false,
         afterDelivery: (() -> Unit)? = null,
     ) {
         if (isFinal || intents.count { !it.isPartial } < MAX_PENDING_CONTROL_INTENTS) {
-            intents.addLast(RenderIntent(generation, text, isFinal = isFinal, afterDelivery = afterDelivery))
+            intents.addLast(
+                RenderIntent(
+                    generation,
+                    text,
+                    isFinal = isFinal,
+                    forceNewDocument = forceNewDocument,
+                    afterDelivery = afterDelivery,
+                ),
+            )
             writerWakeups.trySend(Unit)
         }
     }
