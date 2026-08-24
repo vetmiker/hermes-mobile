@@ -36,7 +36,7 @@ class MyvuDisplayRendererTest {
     }
 
     @Test
-    fun thinkingAndResponseEachMintOneIdentity() {
+    fun thinkingAndResponseEachMintOneIdentityWhenNoInputIsActive() {
         var documentNumber = 0
         val renderer = MyvuDisplayRenderer(documentId = { "document-${++documentNumber}" })
 
@@ -46,8 +46,36 @@ class MyvuDisplayRendererTest {
 
         assertEquals(thinking[0].documentKey, thinkingUpdate[0].documentKey)
         assertEquals(messageId(thinking[0]), messageId(thinkingUpdate[1]))
+        assertEquals("Thinking", sourceText(thinking[1]))
+        assertEquals("Thinking\n\n• read_file — Running", sourceText(thinkingUpdate[1]))
         assertNotEquals(thinking[0].documentKey, response[0].documentKey)
         assertNotEquals(messageId(thinking[0]), messageId(response[0]))
+    }
+
+    @Test
+    fun thinkingReusesActiveInputIdentityAndKeepsInputPrefixOnceAcrossToolUpdates() {
+        var documentNumber = 0
+        val renderer = MyvuDisplayRenderer(documentId = { "document-${++documentNumber}" })
+
+        val input = renderer.commandsFor("Transcribed question", DisplayKind.Input)
+        val thinking = renderer.openThinking("Thinking", GlassesReadability())
+        val toolUpdate = renderer.updateThinking("Thinking\n\n• read_file — Running")
+        val response = renderer.openResponse("Response", GlassesReadability())
+        val nextThinking = renderer.openThinking("Thinking", GlassesReadability())
+
+        assertEquals(input[0].documentKey, thinking[0].documentKey)
+        assertEquals(thinking[0].documentKey, toolUpdate[0].documentKey)
+        assertEquals(messageId(input[0]), messageId(thinking[0]))
+        assertEquals(messageId(thinking[0]), messageId(toolUpdate[1]))
+        assertEquals("Transcribed question\n\nThinking", sourceText(thinking[1]))
+        assertEquals(
+            "Transcribed question\n\nThinking\n\n• read_file — Running",
+            sourceText(toolUpdate[1]),
+        )
+        assertNotEquals(thinking[0].documentKey, response[0].documentKey)
+        assertNotEquals(messageId(thinking[0]), messageId(response[0]))
+        assertNotEquals(response[0].documentKey, nextThinking[0].documentKey)
+        assertEquals("Thinking", sourceText(nextThinking[1]))
     }
 
     @Test
@@ -116,6 +144,14 @@ class MyvuDisplayRendererTest {
         assertTrue(update[1].payload.contains("\\\"fileKey\\\":\\\"doc/hermes-agent\\\""))
         assertTrue(update[1].payload.contains("Partial answer"))
         assertTrue(update.none { it.fontMode != null })
+    }
+
+    private fun sourceText(command: MyvuDisplayCommand): String {
+        val data = Json.parseToJsonElement(command.payload).jsonObject["data"]!!.jsonObject
+        return Json
+            .parseToJsonElement(data["value"]!!.jsonPrimitive.content)
+            .jsonObject["sourceText"]!!
+            .jsonPrimitive.content
     }
 
     private fun messageId(command: MyvuDisplayCommand): String {

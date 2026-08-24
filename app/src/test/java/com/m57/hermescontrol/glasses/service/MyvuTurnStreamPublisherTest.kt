@@ -1,5 +1,6 @@
 package com.m57.hermescontrol.glasses.service
 
+import com.m57.hermescontrol.glasses.myvu.DisplayKind
 import com.m57.hermescontrol.glasses.myvu.GlassesFontMode
 import com.m57.hermescontrol.glasses.myvu.GlassesReadability
 import com.m57.hermescontrol.glasses.myvu.MyvuDisplayCommand
@@ -41,6 +42,42 @@ class MyvuTurnStreamPublisherTest {
             assertFalse(texts[1].contains("Buffered"))
             assertTrue(texts[1].startsWith("Thinking\n\n• read_file: /tmp/x — Starting"))
             assertEquals(listOf("open_app", "send_content", "set_font_mode"), commandActions(commands).take(3))
+            publisher.close()
+        }
+
+    @Test
+    fun thinkingKeepsPhoneInputVisibleWithoutLeakingBufferedAssistantProse() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val renderer = MyvuDisplayRenderer(documentId = { "input-document" })
+            commands += renderer.commandsFor("Phone question", DisplayKind.Input)
+            val publisher =
+                MyvuTurnStreamPublisher(
+                    renderer = renderer,
+                    readability = { GlassesReadability() },
+                    writer = MyvuCommandWriter { commands += it },
+                    writerDispatcher = StandardTestDispatcher(testScheduler),
+                )
+
+            publisher.startEpoch()
+            runCurrent()
+            publisher.publishToken("Buffered assistant prose")
+            advanceTimeBy(200)
+            publisher.publishToolStart("read_file", mapOf("path" to "/tmp/x"))
+            advanceUntilIdle()
+
+            val texts = visibleTexts(commands)
+            assertEquals(
+                listOf(
+                    "Phone question",
+                    "Phone question\n\nThinking",
+                    "Phone question\n\nThinking\n\n• read_file: /tmp/x — Starting",
+                ),
+                texts,
+            )
+            assertEquals(1, contentCommands(commands).map { it.documentKey }.distinct().size)
+            assertEquals(1, contentCommands(commands).map(::messageId).distinct().size)
+            assertFalse(texts.last().contains("Buffered assistant prose"))
             publisher.close()
         }
 

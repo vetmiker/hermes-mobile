@@ -54,6 +54,8 @@ class MyvuDisplayRenderer(
     )
 
     private var activeDocument: DocumentIdentity? = null
+    private var activeInputDocument: DocumentIdentity? = null
+    private var activeInputText: String? = null
     private var thinkingDocument: DocumentIdentity? = null
     private var responseDocument: DocumentIdentity? = null
 
@@ -67,30 +69,34 @@ class MyvuDisplayRenderer(
         if (kind == DisplayKind.Response) return openResponse(text, readability)
 
         val document = activeDocument ?: newDocument(readability).also { activeDocument = it }
+        if (kind == DisplayKind.Input) {
+            activeInputDocument = document
+            activeInputText = text
+        }
         return openDocument(text, document, readability)
     }
 
     /**
-     * Starts the visible turn marker on a fresh MYVU document.
+     * Extends the active input document with the turn marker when one exists.
      *
-     * Thinking and Response are separate documents so that the response has one
-     * uninterrupted scroll lifetime.
+     * A response begins on its own document, so preserving the input here keeps
+     * the prompt visible during tool work without contaminating response scroll.
      */
     @Synchronized
     fun openThinking(
         text: String,
         readability: GlassesReadability,
     ): List<MyvuDisplayCommand> {
-        val document = newDocument(readability)
+        val document = activeInputDocument ?: newDocument(readability)
         thinkingDocument = document
         activeDocument = document
-        return openDocument(text, document, readability)
+        return openDocument(thinkingText(text), document, readability)
     }
 
     @Synchronized
     fun updateThinking(text: String): List<MyvuDisplayCommand> =
         updateDocument(
-            text = text,
+            text = thinkingText(text),
             document = checkNotNull(thinkingDocument) { "A thinking document must be opened first" },
         )
 
@@ -100,6 +106,9 @@ class MyvuDisplayRenderer(
         readability: GlassesReadability = GlassesReadability(),
     ): List<MyvuDisplayCommand> {
         val document = newDocument(readability)
+        activeInputDocument = null
+        activeInputText = null
+        thinkingDocument = null
         responseDocument = document
         activeDocument = document
         return openDocument(text, document, readability)
@@ -114,6 +123,8 @@ class MyvuDisplayRenderer(
             text = text,
             document = checkNotNull(responseDocument) { "A response document must be opened first" },
         )
+
+    private fun thinkingText(text: String): String = activeInputText?.let { "$it\n\n$text" } ?: text
 
     private fun newDocument(readability: GlassesReadability): DocumentIdentity =
         DocumentIdentity(
