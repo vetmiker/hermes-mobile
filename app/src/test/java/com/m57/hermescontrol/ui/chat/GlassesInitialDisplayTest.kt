@@ -6,8 +6,12 @@ import org.junit.Test
 
 class GlassesInitialDisplayTest {
     @Test
-    fun returns_neutral_display_for_an_empty_session() {
+    fun returns_neutral_display_for_a_session_without_conversation() {
         assertEquals("Hermes is ready.", initialGlassesDisplay(emptyList()))
+        assertEquals(
+            "Hermes is ready.",
+            initialGlassesDisplay(listOf(message("session", MessageRole.SYSTEM, "Session created"))),
+        )
     }
 
     @Test

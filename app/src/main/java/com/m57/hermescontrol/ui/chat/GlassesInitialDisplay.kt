@@ -20,9 +20,15 @@ internal fun initialGlassesDisplay(
     streamingMessage: ChatMessage? = null,
 ): String? {
     if (isAgentTyping || streamingMessage != null) return null
-    if (messages.isEmpty()) return EMPTY_SESSION_DISPLAY
-
     val turns = groupIntoTurns(messages)
+    if (
+        turns.all { turn ->
+            turn is ChatTurn.Agent && turn.entries.all { it is AgentEntry.SystemEvent }
+        }
+    ) {
+        return EMPTY_SESSION_DISPLAY
+    }
+
     val userTurnIndex = turns.indexOfLast { it is ChatTurn.User }
     val userTurn = turns.getOrNull(userTurnIndex) as? ChatTurn.User ?: return null
     val agentTurn = turns.getOrNull(userTurnIndex + 1) as? ChatTurn.Agent ?: return null
