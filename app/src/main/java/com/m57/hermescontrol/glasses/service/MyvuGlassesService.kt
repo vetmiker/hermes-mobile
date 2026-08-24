@@ -17,6 +17,7 @@ import androidx.core.app.NotificationCompat
 import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.glasses.ChatTurnCoordinatorProvider
+import com.m57.hermescontrol.glasses.GlassesInitialDisplayKind
 import com.m57.hermescontrol.glasses.GlassesModeControllerProvider
 import com.m57.hermescontrol.glasses.GlassesModeSnapshot
 import com.m57.hermescontrol.glasses.GlassesModeState
@@ -49,13 +50,46 @@ internal data class MyvuGlassesStartRequest(
     val storedSessionId: String?,
     val runtimeSessionId: String?,
     val initialDisplay: String?,
+    val initialDisplayKind: GlassesInitialDisplayKind?,
 ) {
     val isValid: Boolean
         get() =
             !storedSessionId.isNullOrBlank() &&
                 !runtimeSessionId.isNullOrBlank() &&
-                !initialDisplay.isNullOrBlank()
+                !initialDisplay.isNullOrBlank() &&
+                initialDisplayKind != null
 }
+
+internal fun Intent.toMyvuGlassesStartRequest(): MyvuGlassesStartRequest =
+    MyvuGlassesStartRequest(
+        storedSessionId = getStringExtra(MyvuGlassesService.EXTRA_STORED_SESSION_ID),
+        runtimeSessionId = getStringExtra(MyvuGlassesService.EXTRA_RUNTIME_SESSION_ID),
+        initialDisplay = getStringExtra(MyvuGlassesService.EXTRA_INITIAL_DISPLAY),
+        initialDisplayKind =
+            getStringExtra(MyvuGlassesService.EXTRA_INITIAL_DISPLAY_KIND)
+                ?.let { encoded -> GlassesInitialDisplayKind.entries.firstOrNull { it.name == encoded } },
+    )
+
+internal data class MyvuGlassesStartupPresentation(
+    val initialDisplayKind: DisplayKind,
+    val sessionLoadedDisplayKind: DisplayKind?,
+)
+
+internal fun myvuGlassesStartupPresentation(
+    initialDisplayKind: GlassesInitialDisplayKind,
+): MyvuGlassesStartupPresentation =
+    when (initialDisplayKind) {
+        GlassesInitialDisplayKind.NEUTRAL ->
+            MyvuGlassesStartupPresentation(
+                initialDisplayKind = DisplayKind.Context,
+                sessionLoadedDisplayKind = DisplayKind.Status,
+            )
+        GlassesInitialDisplayKind.COMPLETED_RESPONSE ->
+            MyvuGlassesStartupPresentation(
+                initialDisplayKind = DisplayKind.Response,
+                sessionLoadedDisplayKind = null,
+            )
+    }
 
 internal data class MyvuGlassesMirrorPayload(
     val generation: Long,
@@ -180,21 +214,17 @@ class MyvuGlassesService : Service() {
                 START_NOT_STICKY
             }
             ACTION_START -> {
-                val request =
-                    MyvuGlassesStartRequest(
-                        storedSessionId = intent.getStringExtra(EXTRA_STORED_SESSION_ID),
-                        runtimeSessionId = intent.getStringExtra(EXTRA_RUNTIME_SESSION_ID),
-                        initialDisplay = intent.getStringExtra(EXTRA_INITIAL_DISPLAY),
-                    )
+                val request = intent.toMyvuGlassesStartRequest()
                 if (!request.isValid || !hasMicrophonePermission()) {
                     Log.w(TAG, "MYVU_SERVICE start refused microphone permission or payload")
                     stopSelf(startId)
                 } else {
                     promoteToForeground(getString(R.string.myvu_audio_preparing_text))
                     start(
-                        checkNotNull(request.storedSessionId),
-                        checkNotNull(request.runtimeSessionId),
-                        checkNotNull(request.initialDisplay),
+                        storedSessionId = checkNotNull(request.storedSessionId),
+                        runtimeSessionId = checkNotNull(request.runtimeSessionId),
+                        initialDisplay = checkNotNull(request.initialDisplay),
+                        initialDisplayKind = checkNotNull(request.initialDisplayKind),
                     )
                 }
                 START_NOT_STICKY
@@ -223,11 +253,13 @@ class MyvuGlassesService : Service() {
         storedSessionId: String,
         runtimeSessionId: String,
         initialDisplay: String,
+        initialDisplayKind: GlassesInitialDisplayKind,
     ) {
         stopSession()
         val job = SupervisorJob(serviceScope.coroutineContext[Job])
         sessionJob = job
         val scope = CoroutineScope(job + Dispatchers.Main.immediate)
+        val startupPresentation = myvuGlassesStartupPresentation(initialDisplayKind)
         val starting = GlassesModeControllerProvider.controller.start(storedSessionId, runtimeSessionId)
         val currentTransport = MyvuTransport(applicationContext)
         transport = currentTransport
@@ -254,7 +286,7 @@ class MyvuGlassesService : Service() {
                     return@launch
                 }
                 if (!ownsPreparation(preparation)) return@launch
-                render(initialDisplay, DisplayKind.Context)
+                render(initialDisplay, startupPresentation.initialDisplayKind)
                 val models =
                     try {
                         WhisperModelStore(applicationContext).prepare()
@@ -296,7 +328,9 @@ class MyvuGlassesService : Service() {
                             } else {
                                 val sessionLoaded =
                                     getString(R.string.myvu_audio_session_loaded_text)
-                                render(sessionLoaded, DisplayKind.Status)
+                                startupPresentation.sessionLoadedDisplayKind?.let { displayKind ->
+                                    render(sessionLoaded, displayKind)
+                                }
                                 promoteToForeground(sessionLoaded)
                                 engine = localEngine
                                 true
@@ -707,6 +741,7 @@ class MyvuGlassesService : Service() {
         const val EXTRA_STORED_SESSION_ID = "com.m57.hermescontrol.glasses.extra.STORED_SESSION_ID"
         const val EXTRA_RUNTIME_SESSION_ID = "com.m57.hermescontrol.glasses.extra.RUNTIME_SESSION_ID"
         const val EXTRA_INITIAL_DISPLAY = "com.m57.hermescontrol.glasses.extra.INITIAL_DISPLAY"
+        const val EXTRA_INITIAL_DISPLAY_KIND = "com.m57.hermescontrol.glasses.extra.INITIAL_DISPLAY_KIND"
         internal const val EXTRA_GENERATION = "com.m57.hermescontrol.glasses.extra.GENERATION"
         internal const val EXTRA_MIRROR_ID = "com.m57.hermescontrol.glasses.extra.MIRROR_ID"
         internal const val EXTRA_DISPLAY_TEXT = "com.m57.hermescontrol.glasses.extra.DISPLAY_TEXT"

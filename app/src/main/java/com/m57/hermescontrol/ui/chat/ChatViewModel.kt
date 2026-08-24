@@ -1373,7 +1373,7 @@ class ChatViewModel(
         if (
             storedSessionId.isNullOrBlank() ||
             activeRuntimeSessionId.isNullOrBlank() ||
-            initialDisplay.isNullOrBlank()
+            initialDisplay == null
         ) {
             return false
         }
@@ -1382,7 +1382,11 @@ class ChatViewModel(
                 .setAction(MyvuGlassesService.ACTION_START)
                 .putExtra(MyvuGlassesService.EXTRA_STORED_SESSION_ID, storedSessionId)
                 .putExtra(MyvuGlassesService.EXTRA_RUNTIME_SESSION_ID, activeRuntimeSessionId)
-                .putExtra(MyvuGlassesService.EXTRA_INITIAL_DISPLAY, initialDisplay)
+                .putExtra(MyvuGlassesService.EXTRA_INITIAL_DISPLAY, initialDisplay.text)
+                .putExtra(
+                    MyvuGlassesService.EXTRA_INITIAL_DISPLAY_KIND,
+                    initialDisplay.kind.name,
+                )
         ContextCompat.startForegroundService(context, intent)
         return true
     }

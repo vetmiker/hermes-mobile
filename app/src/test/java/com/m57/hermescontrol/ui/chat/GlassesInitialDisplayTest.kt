@@ -1,5 +1,6 @@
 package com.m57.hermescontrol.ui.chat
 
+import com.m57.hermescontrol.glasses.GlassesInitialDisplayKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -7,9 +8,12 @@ import org.junit.Test
 class GlassesInitialDisplayTest {
     @Test
     fun returns_neutral_display_for_a_session_without_conversation() {
-        assertEquals("Hermes is ready.", initialGlassesDisplay(emptyList()))
         assertEquals(
-            "Hermes is ready.",
+            expectedInitialDisplay("Hermes is ready.", GlassesInitialDisplayKind.NEUTRAL),
+            initialGlassesDisplay(emptyList()),
+        )
+        assertEquals(
+            expectedInitialDisplay("Hermes is ready.", GlassesInitialDisplayKind.NEUTRAL),
             initialGlassesDisplay(listOf(message("session", MessageRole.SYSTEM, "Session created"))),
         )
     }
@@ -50,7 +54,13 @@ class GlassesInitialDisplayTest {
                 ),
             )
 
-        assertEquals("You:\nLatest prompt\n\nHermes:\nLatest answer", display)
+        assertEquals(
+            expectedInitialDisplay(
+                "You:\nLatest prompt\n\nHermes:\nLatest answer",
+                GlassesInitialDisplayKind.COMPLETED_RESPONSE,
+            ),
+            display,
+        )
     }
 
     @Test
@@ -67,8 +77,11 @@ class GlassesInitialDisplayTest {
             )
 
         assertEquals(
-            "You:\nInvestigate the build\n\nHermes:\n" +
-                "I will inspect the logs.\n\nThe build failed because tests are red.",
+            expectedInitialDisplay(
+                "You:\nInvestigate the build\n\nHermes:\n" +
+                    "I will inspect the logs.\n\nThe build failed because tests are red.",
+                GlassesInitialDisplayKind.COMPLETED_RESPONSE,
+            ),
             display,
         )
     }
@@ -86,6 +99,11 @@ class GlassesInitialDisplayTest {
 
         assertNull(display)
     }
+
+    private fun expectedInitialDisplay(
+        text: String,
+        kind: GlassesInitialDisplayKind,
+    ) = GlassesInitialDisplay(text, kind)
 
     private fun message(
         id: String,

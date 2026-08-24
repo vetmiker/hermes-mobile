@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.m57.hermescontrol.glasses.GlassesInitialDisplayKind
 import com.m57.hermescontrol.glasses.service.MyvuGlassesService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -190,7 +191,11 @@ class MyvuDiagnosticActivity : Activity() {
                 .setAction(MyvuGlassesService.ACTION_START)
                 .putExtra(MyvuGlassesService.EXTRA_STORED_SESSION_ID, DIAGNOSTIC_SESSION_ID)
                 .putExtra(MyvuGlassesService.EXTRA_RUNTIME_SESSION_ID, DIAGNOSTIC_SESSION_ID)
-                .putExtra(MyvuGlassesService.EXTRA_INITIAL_DISPLAY, DIAGNOSTIC_INITIAL_DISPLAY),
+                .putExtra(MyvuGlassesService.EXTRA_INITIAL_DISPLAY, DIAGNOSTIC_INITIAL_DISPLAY)
+                .putExtra(
+                    MyvuGlassesService.EXTRA_INITIAL_DISPLAY_KIND,
+                    GlassesInitialDisplayKind.NEUTRAL.name,
+                ),
         )
         Log.i(TAG, "MYVU_AUDIO_DIAGNOSTIC start requested")
         finish()
