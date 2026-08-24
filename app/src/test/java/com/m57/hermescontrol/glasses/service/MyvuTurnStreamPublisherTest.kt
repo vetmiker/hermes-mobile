@@ -6,7 +6,6 @@ import com.m57.hermescontrol.glasses.myvu.MyvuDisplayCommand
 import com.m57.hermescontrol.glasses.myvu.MyvuDisplayRenderer
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -25,26 +24,349 @@ import java.util.concurrent.atomic.AtomicInteger
 @OptIn(ExperimentalCoroutinesApi::class)
 class MyvuTurnStreamPublisherTest {
     @Test
-    fun tokensOpenOneDocumentThenCoalesceCumulativeUpdates() =
+    fun startEpochPublishesExactThinkingBeforeTokensAndTools() =
         runTest {
             val commands = mutableListOf<MyvuDisplayCommand>()
             val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
             publisher.startEpoch()
-
-            publisher.publishToken("Hello")
-            runCurrent()
-            publisher.publishToken(", ")
-            publisher.publishToken("world")
-            advanceTimeBy(199)
             runCurrent()
 
-            assertEquals(listOf("Hello"), visibleTexts(commands))
-
-            advanceTimeBy(1)
+            publisher.publishToken("Buffered")
+            advanceTimeBy(200)
+            publisher.publishToolStart("read_file", mapOf("path" to "/tmp/x"))
             advanceUntilIdle()
 
-            assertEquals(listOf("Hello", "Hello, world"), visibleTexts(commands))
+            val texts = visibleTexts(commands)
+            assertEquals("Thinking", texts.first())
+            assertFalse(texts[1].contains("Buffered"))
+            assertTrue(texts[1].startsWith("Thinking\n\n• read_file: /tmp/x — Starting"))
+            assertEquals(listOf("open_app", "send_content", "set_font_mode"), commandActions(commands).take(3))
+            publisher.close()
+        }
+
+    @Test
+    fun tokensStayOffScreenUntilThePagePlusMarginThreshold() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
+            publisher.startEpoch()
+            runCurrent()
+
+            publisher.publishToken(
+                textWithLines(
+                    MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard) - 1,
+                ),
+            )
+            advanceTimeBy(200)
+            advanceUntilIdle()
+
+            assertEquals(listOf("Thinking"), visibleTexts(commands))
             assertEquals(1, commands.map { it.documentKey }.distinct().size)
+            publisher.close()
+        }
+
+    @Test
+    fun thresholdOpensOneResponseWithAllBufferedText() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val documentIds = AtomicInteger()
+            val publisher =
+                publisher(
+                    commands = commands,
+                    dispatcher = StandardTestDispatcher(testScheduler),
+                    documentId = { "document-${documentIds.incrementAndGet()}" },
+                )
+            val thresholdText =
+                textWithLines(MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard))
+            publisher.startEpoch()
+            runCurrent()
+
+            publisher.publishToken(thresholdText.take(10))
+            publisher.publishToken(thresholdText.drop(10))
+            advanceUntilIdle()
+
+            assertEquals(listOf("Thinking", thresholdText), visibleTexts(commands))
+            assertEquals(
+                listOf("document-1/hermes-agent", "document-2/hermes-agent"),
+                contentDocumentKeys(commands),
+            )
+            publisher.close()
+        }
+
+    @Test
+    fun blockedWriterKeepsThinkingBeforeImmediateThresholdAndFinalResponse() {
+        val commands = mutableListOf<MyvuDisplayCommand>()
+        val dispatcher = BlockingWriterDispatcher()
+        val publisher = publisher(commands, dispatcher)
+        val thresholdText =
+            textWithLines(MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard))
+        publisher.startEpoch()
+        publisher.publishToken(thresholdText)
+        publisher.publishFinal("Authoritative final")
+
+        dispatcher.release()
+
+        assertEquals(listOf("Thinking", "Authoritative final"), visibleTexts(commands))
+        assertEquals(2, commands.map { it.documentKey }.distinct().size)
+        assertEquals(
+            listOf(
+                "open_app",
+                "send_content",
+                "set_font_mode",
+                "open_app",
+                "send_content",
+                "set_font_mode",
+            ),
+            commandActions(commands),
+        )
+        publisher.close()
+    }
+
+    @Test
+    fun thresholdTokenDuringThinkingDeliveryWaitsForThinkingThenOpensResponse() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val thresholdText =
+                textWithLines(MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard))
+            var documentNumber = 0
+            lateinit var publisher: MyvuTurnStreamPublisher
+            publisher =
+                MyvuTurnStreamPublisher(
+                    renderer = MyvuDisplayRenderer(documentId = { "document-${++documentNumber}" }),
+                    readability = { GlassesReadability() },
+                    writer =
+                        MyvuCommandWriter { command ->
+                            commands += command
+                            if (commands.size == 1) publisher.publishToken(thresholdText)
+                        },
+                    writerDispatcher = StandardTestDispatcher(testScheduler),
+                )
+            publisher.startEpoch()
+            advanceUntilIdle()
+
+            assertEquals(listOf("Thinking", thresholdText), visibleTexts(commands))
+            assertEquals(2, commands.map { it.documentKey }.distinct().size)
+            publisher.close()
+        }
+
+    @Test
+    fun partialToolAndFinalUpdatesKeepTheOneResponseIdentity() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
+            val thresholdText =
+                textWithLines(MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard))
+            publisher.startEpoch()
+            runCurrent()
+            publisher.publishToken(thresholdText)
+            advanceUntilIdle()
+
+            publisher.publishToken(" tail")
+            advanceTimeBy(200)
+            advanceUntilIdle()
+            publisher.publishToolStart("read_file", mapOf("path" to "/tmp/x"))
+            advanceUntilIdle()
+            publisher.publishFinal("Final")
+            advanceUntilIdle()
+
+            val responseCommands = contentCommands(commands).drop(1)
+            assertEquals(1, responseCommands.map { it.documentKey }.distinct().size)
+            assertEquals(1, responseCommands.map(::messageId).distinct().size)
+            assertEquals(
+                listOf(
+                    thresholdText,
+                    "$thresholdText tail",
+                    "$thresholdText tail\n\n• read_file: /tmp/x — Starting",
+                    "Final",
+                ),
+                visibleTexts(commands).drop(1),
+            )
+            assertEquals(2, commands.map { it.documentKey }.distinct().size)
+            publisher.close()
+        }
+
+    @Test
+    fun shortFinalOpensOneResponseAndNeverMintsAThirdIdentity() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
+            publisher.startEpoch()
+            runCurrent()
+
+            publisher.publishToken("Buffered")
+            publisher.publishFinal("Short final")
+            advanceUntilIdle()
+
+            assertEquals(listOf("Thinking", "Short final"), visibleTexts(commands))
+            assertEquals(2, commands.map { it.documentKey }.distinct().size)
+            assertEquals(1, contentCommands(commands).drop(1).map(::messageId).distinct().size)
+            publisher.close()
+        }
+
+    @Test
+    fun completeOnlyFinalKeepsThinkingThenOpensOneResponse() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
+            publisher.startEpoch()
+            runCurrent()
+
+            publisher.publishFinal("Complete response")
+            advanceUntilIdle()
+
+            assertEquals(listOf("Thinking", "Complete response"), visibleTexts(commands))
+            assertEquals(2, commands.map { it.documentKey }.distinct().size)
+            publisher.close()
+        }
+
+    @Test
+    fun finalFencesQueuedResponseButPreservesThinking() {
+        val commands = mutableListOf<MyvuDisplayCommand>()
+        val dispatcher = BlockingWriterDispatcher()
+        val publisher = publisher(commands, dispatcher)
+        val thresholdText =
+            textWithLines(MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard))
+        publisher.startEpoch()
+        publisher.publishToken(thresholdText)
+        publisher.publishFinal("Final")
+
+        dispatcher.release()
+
+        assertEquals(listOf("Thinking", "Final"), visibleTexts(commands))
+        assertEquals(2, contentCommands(commands).size)
+        publisher.close()
+    }
+
+    @Test
+    fun newEpochAndCloseSuppressStaleQueuedWork() {
+        val commands = mutableListOf<MyvuDisplayCommand>()
+        val dispatcher = BlockingWriterDispatcher()
+        val publisher = publisher(commands, dispatcher)
+        publisher.startEpoch()
+        publisher.publishToken(
+            textWithLines(MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard)),
+        )
+        publisher.startEpoch()
+        publisher.publishFinal("Fresh")
+        dispatcher.release()
+
+        assertEquals(listOf("Thinking", "Fresh"), visibleTexts(commands))
+        publisher.close()
+        assertEquals(listOf("Thinking", "Fresh"), visibleTexts(commands))
+
+        val closedCommands = mutableListOf<MyvuDisplayCommand>()
+        val closeDispatcher = BlockingWriterDispatcher()
+        val closedPublisher = publisher(closedCommands, closeDispatcher)
+        closedPublisher.startEpoch()
+        closedPublisher.publishToken(
+            textWithLines(MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard)),
+        )
+        closedPublisher.close()
+        closeDispatcher.release()
+        assertTrue(closedCommands.isEmpty())
+    }
+
+    @Test
+    fun newEpochAfterResponseOpenCompletesPairAndSuppressesFinalCallback() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val delivered = AtomicInteger()
+            val opened = AtomicInteger()
+            lateinit var publisher: MyvuTurnStreamPublisher
+            publisher =
+                MyvuTurnStreamPublisher(
+                    renderer = MyvuDisplayRenderer(),
+                    readability = { GlassesReadability() },
+                    writer =
+                        MyvuCommandWriter { command ->
+                            commands += command
+                            if (
+                                commandActions(listOf(command)) == listOf("open_app") &&
+                                opened.incrementAndGet() == 2
+                            ) {
+                                publisher.startEpoch()
+                            }
+                        },
+                    writerDispatcher = StandardTestDispatcher(testScheduler),
+                )
+            publisher.startEpoch()
+            runCurrent()
+
+            publisher.publishFinal("Final") { delivered.incrementAndGet() }
+            advanceUntilIdle()
+
+            assertEquals(listOf("Thinking", "Final", "Thinking"), visibleTexts(commands))
+            assertEquals(0, delivered.get())
+            assertEquals(
+                commands.count { commandActions(listOf(it)) == listOf("open_app") },
+                commands.count { commandActions(listOf(it)) == listOf("send_content") },
+            )
+            publisher.close()
+        }
+
+    @Test
+    fun closeAfterResponseOpenCompletesPairAndSuppressesFinalCallback() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val delivered = AtomicInteger()
+            val opened = AtomicInteger()
+            lateinit var publisher: MyvuTurnStreamPublisher
+            publisher =
+                MyvuTurnStreamPublisher(
+                    renderer = MyvuDisplayRenderer(),
+                    readability = { GlassesReadability() },
+                    writer =
+                        MyvuCommandWriter { command ->
+                            commands += command
+                            if (
+                                commandActions(listOf(command)) == listOf("open_app") &&
+                                opened.incrementAndGet() == 2
+                            ) {
+                                publisher.close()
+                            }
+                        },
+                    writerDispatcher = StandardTestDispatcher(testScheduler),
+                )
+            publisher.startEpoch()
+            runCurrent()
+
+            publisher.publishFinal("Final") { delivered.incrementAndGet() }
+            advanceUntilIdle()
+
+            assertEquals(listOf("Thinking", "Final"), visibleTexts(commands))
+            assertEquals(0, delivered.get())
+            assertEquals(
+                commands.count { commandActions(listOf(it)) == listOf("open_app") },
+                commands.count { commandActions(listOf(it)) == listOf("send_content") },
+            )
+        }
+
+    @Test
+    fun everyAcceptedVisibleUpdateUsesTheOpenContentPair() =
+        runTest {
+            val commands = mutableListOf<MyvuDisplayCommand>()
+            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
+            val surface = ContentGatedSurface()
+            val thresholdText =
+                textWithLines(MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard))
+            publisher.startEpoch()
+            runCurrent()
+            publisher.publishToolStart("read_file", mapOf("path" to "/tmp/x"))
+            publisher.publishToken(thresholdText)
+            publisher.publishToken(" tail")
+            advanceTimeBy(200)
+            advanceUntilIdle()
+            publisher.publishFinal("Final")
+            advanceUntilIdle()
+
+            commands.forEach(surface::receive)
+
+            assertEquals(visibleTexts(commands), surface.visibleTexts)
+            assertTrue(commandActions(commands).windowed(2).all { it != listOf("open_app", "set_font_mode") })
+            assertEquals(
+                commands.count { commandActions(listOf(it)) == listOf("open_app") },
+                commands.count { commandActions(listOf(it)) == listOf("send_content") },
+            )
             publisher.close()
         }
 
@@ -57,540 +379,16 @@ class MyvuTurnStreamPublisherTest {
         assertEquals(3, MyvuResponsePageLayout.estimatedWrappedLines("x\nx\n", fontMode))
     }
 
-    @Test
-    fun standardFontRekeysAtThePagePlusOneLineMargin() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val documentIds = AtomicInteger()
-            val publisher =
-                publisher(
-                    commands = commands,
-                    dispatcher = StandardTestDispatcher(testScheduler),
-                    documentId = { "document-${documentIds.incrementAndGet()}" },
-                )
-            val pageCapacity =
-                MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard) -
-                    MyvuResponsePageLayout.OVERFLOW_MARGIN_LINES
-            publisher.startEpoch()
-
-            publisher.publishToken(textWithLines(pageCapacity))
-            advanceUntilIdle()
-            publisher.publishToken("\nx")
-            advanceTimeBy(200)
-            advanceUntilIdle()
-
-            assertEquals(
-                listOf("document-1/hermes-agent", "document-2/hermes-agent"),
-                responseDocumentKeys(commands),
-            )
-            publisher.close()
-        }
-
-    @Test
-    fun largeFontRekeysAtItsPagePlusOneLineMargin() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val documentIds = AtomicInteger()
-            val publisher =
-                publisher(
-                    commands = commands,
-                    dispatcher = StandardTestDispatcher(testScheduler),
-                    readability = { GlassesReadability(fontMode = GlassesFontMode.Large) },
-                    documentId = { "document-${documentIds.incrementAndGet()}" },
-                )
-            val pageCapacity =
-                MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Large) -
-                    MyvuResponsePageLayout.OVERFLOW_MARGIN_LINES
-            publisher.startEpoch()
-
-            publisher.publishToken(textWithLines(pageCapacity))
-            advanceUntilIdle()
-            publisher.publishToken("\nx")
-            advanceTimeBy(200)
-            advanceUntilIdle()
-
-            assertEquals(
-                listOf("document-1/hermes-agent", "document-2/hermes-agent"),
-                responseDocumentKeys(commands),
-            )
-            assertTrue(commands.any { it.fontMode == GlassesFontMode.Large })
-            publisher.close()
-        }
-
-    @Test
-    fun overflowRekeysOnceThenPartialAndFinalReuseTheScrollingDocument() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val documentIds = AtomicInteger()
-            val publisher =
-                publisher(
-                    commands = commands,
-                    dispatcher = StandardTestDispatcher(testScheduler),
-                    documentId = { "document-${documentIds.incrementAndGet()}" },
-                )
-            val overflowingText =
-                textWithLines(
-                    MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard) + 1,
-                )
-            publisher.startEpoch()
-
-            publisher.publishToken("x")
-            runCurrent()
-            publisher.publishToken(overflowingText.drop(1))
-            advanceUntilIdle()
-            publisher.publishToken(" tail")
-            advanceTimeBy(200)
-            advanceUntilIdle()
-            publisher.publishFinal("Authoritative final")
-            advanceUntilIdle()
-
-            assertEquals(
-                listOf(
-                    "document-1/hermes-agent",
-                    "document-2/hermes-agent",
-                    "document-2/hermes-agent",
-                    "document-2/hermes-agent",
-                ),
-                responseDocumentKeys(commands),
-            )
-            assertEquals(overflowingText, visibleTexts(commands)[1])
-            assertEquals("Authoritative final", visibleTexts(commands).last())
-            publisher.close()
-        }
-
-    @Test
-    fun overflowSupersedesQueuedPreScrollPartialAndToolProjections() {
-        val commands = mutableListOf<MyvuDisplayCommand>()
-        val dispatcher = BlockingWriterDispatcher()
-        val documentIds = AtomicInteger()
-        val publisher =
-            publisher(
-                commands = commands,
-                dispatcher = dispatcher,
-                documentId = { "document-${documentIds.incrementAndGet()}" },
-            )
-        val overflowingText =
-            textWithLines(
-                MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard) + 1,
-            )
-        publisher.startEpoch()
-
-        publisher.publishToken("x")
-        publisher.publishToolStart("read_file", mapOf("path" to "/obsolete"))
-        publisher.publishToken(overflowingText.drop(1))
-        dispatcher.release()
-
-        assertEquals(listOf(overflowingText), visibleTexts(commands))
-        assertEquals(listOf("document-1/hermes-agent"), responseDocumentKeys(commands))
-        assertEquals(
-            listOf("open_app", "send_content", "set_font_mode"),
-            commandActions(commands),
-        )
-        publisher.close()
-    }
-
-    @Test
-    fun canceledQueuedOverflowDoesNotActivateScrollingForTheNextEpoch() {
-        val commands = mutableListOf<MyvuDisplayCommand>()
-        val dispatcher = BlockingWriterDispatcher()
-        val documentIds = AtomicInteger()
-        val publisher =
-            publisher(
-                commands = commands,
-                dispatcher = dispatcher,
-                documentId = { "document-${documentIds.incrementAndGet()}" },
-            )
-        val overflowingText =
-            textWithLines(
-                MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard) + 1,
-            )
-        publisher.startEpoch()
-        publisher.publishToken("x")
-        publisher.publishToken(overflowingText.drop(1))
-
-        publisher.startEpoch()
-        publisher.publishToken("Replacement")
-        dispatcher.release()
-
-        assertEquals(listOf("Replacement"), visibleTexts(commands))
-        assertEquals(listOf("document-1/hermes-agent"), responseDocumentKeys(commands))
-        publisher.close()
-    }
-
-    @Test
-    fun contentGatedSurfaceAcceptsFirstUpdateAndFinalPublisherSequence() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
-            val surface = ContentGatedSurface()
-            publisher.startEpoch()
-
-            publisher.publishToken("First")
-            runCurrent()
-            publisher.publishToken(" update")
-            advanceTimeBy(200)
-            advanceUntilIdle()
-            publisher.publishFinal("Final")
-            advanceUntilIdle()
-
-            commands.forEach(surface::receive)
-
-            assertEquals(listOf("First", "First update", "Final"), surface.visibleTexts)
-            publisher.close()
-        }
-
-    @Test
-    fun closeDuringFinalDocumentDeliveryStopsRemainingCommandsAndCallback() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val delivered = AtomicInteger()
-            lateinit var publisher: MyvuTurnStreamPublisher
-            publisher =
-                MyvuTurnStreamPublisher(
-                    renderer = MyvuDisplayRenderer(documentId = { "document" }),
-                    readability = { GlassesReadability() },
-                    writer =
-                        MyvuCommandWriter { command ->
-                            commands += command
-                            if (commandActions(listOf(command)) == listOf("open_app")) publisher.close()
-                        },
-                    writerDispatcher = StandardTestDispatcher(testScheduler),
-                )
-            publisher.startEpoch()
-
-            publisher.publishFinal("Final") { delivered.incrementAndGet() }
-            advanceUntilIdle()
-
-            assertEquals(listOf("open_app"), commandActions(commands))
-            assertEquals(0, delivered.get())
-        }
-
-    @Test
-    fun newEpochDuringFinalDocumentDeliveryStopsRemainingCommandsAndCallback() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val delivered = AtomicInteger()
-            lateinit var publisher: MyvuTurnStreamPublisher
-            publisher =
-                MyvuTurnStreamPublisher(
-                    renderer = MyvuDisplayRenderer(documentId = { "document" }),
-                    readability = { GlassesReadability() },
-                    writer =
-                        MyvuCommandWriter { command ->
-                            commands += command
-                            if (commandActions(listOf(command)) == listOf("open_app")) publisher.startEpoch()
-                        },
-                    writerDispatcher = StandardTestDispatcher(testScheduler),
-                )
-            publisher.startEpoch()
-
-            publisher.publishFinal("Final") { delivered.incrementAndGet() }
-            advanceUntilIdle()
-
-            assertEquals(listOf("open_app"), commandActions(commands))
-            assertEquals(0, delivered.get())
-            publisher.close()
-        }
-
-    @Test
-    fun finalAfterToolAndPartialReusesExistingDocumentBeforeDeliveryCallback() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val documentIds = AtomicInteger()
-            val publisher =
-                MyvuTurnStreamPublisher(
-                    renderer = MyvuDisplayRenderer(documentId = { "document-${documentIds.incrementAndGet()}" }),
-                    readability = { GlassesReadability() },
-                    writer = MyvuCommandWriter { commands += it },
-                    writerDispatcher = StandardTestDispatcher(testScheduler),
-                )
-            var actionsAtDelivery: List<String>? = null
-            publisher.startEpoch()
-
-            publisher.publishToolStart("read_file", mapOf("path" to "/tmp/x"))
-            advanceUntilIdle()
-            publisher.publishToken("Partial")
-            advanceUntilIdle()
-            publisher.publishFinal("Final") { actionsAtDelivery = commandActions(commands) }
-            advanceUntilIdle()
-
-            assertEquals(
-                listOf(
-                    "open_app",
-                    "send_content",
-                    "set_font_mode",
-                    "open_app",
-                    "send_content",
-                    "open_app",
-                    "send_content",
-                ),
-                commandActions(commands),
-            )
-            assertEquals(1, commands.map { it.documentKey }.distinct().size)
-            assertEquals(commandActions(commands), actionsAtDelivery)
-            assertEquals("Final", visibleTexts(commands).last())
-            publisher.close()
-        }
-
-    @Test
-    fun finalThatFirstCrossesTheMarginRekeysOnce() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val documentIds = AtomicInteger()
-            val publisher =
-                publisher(
-                    commands = commands,
-                    dispatcher = StandardTestDispatcher(testScheduler),
-                    documentId = { "document-${documentIds.incrementAndGet()}" },
-                )
-            val finalText =
-                textWithLines(
-                    MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard),
-                )
-            publisher.startEpoch()
-            publisher.publishToken("Short partial")
-            advanceUntilIdle()
-
-            publisher.publishFinal(finalText)
-            advanceUntilIdle()
-
-            assertEquals(
-                listOf("document-1/hermes-agent", "document-2/hermes-agent"),
-                responseDocumentKeys(commands),
-            )
-            assertEquals(finalText, visibleTexts(commands).last())
-            publisher.close()
-        }
-
-    @Test
-    fun completeOnlyLongFinalOpensOneResponseDocument() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
-            val finalText =
-                textWithLines(
-                    MyvuResponsePageLayout.pagePlusOneLineCapacity(GlassesFontMode.Standard),
-                )
-            publisher.startEpoch()
-
-            publisher.publishFinal(finalText)
-            advanceUntilIdle()
-
-            assertEquals(listOf("open_app", "send_content", "set_font_mode"), commandActions(commands))
-            assertEquals(1, commands.map { it.documentKey }.distinct().size)
-            assertEquals(listOf(finalText), visibleTexts(commands))
-            publisher.close()
-        }
-
-    @Test
-    fun finalDropsQueuedPartialAndIsTheLastWrite() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
-            publisher.startEpoch()
-            publisher.publishToken("Partial")
-            runCurrent()
-            publisher.publishToken(" ignored")
-
-            publisher.publishFinal("Authoritative final")
-            advanceUntilIdle()
-
-            assertEquals(listOf("Partial", "Authoritative final"), visibleTexts(commands))
-            publisher.close()
-        }
-
-    @Test
-    fun finalReplacesAnUnconsumedPartialAndOpensItsOwnDocument() {
-        val commands = mutableListOf<MyvuDisplayCommand>()
-        val dispatcher = BlockingWriterDispatcher()
-        val publisher = publisher(commands, dispatcher)
-        val delivered = AtomicInteger()
-        publisher.startEpoch()
-
-        publisher.publishToken("Partial")
-        publisher.publishFinal("Authoritative final") { delivered.incrementAndGet() }
-
-        assertTrue(commands.isEmpty())
-        dispatcher.release()
-
-        assertEquals(listOf("Authoritative final"), visibleTexts(commands))
-        assertEquals(1, commands.count { it.payload.contains("open_app") })
-        assertEquals(1, delivered.get())
-        publisher.close()
-    }
-
-    @Test
-    fun blockedWriterPreservesToolTransitionsInFifoOrder() {
-        val commands = mutableListOf<MyvuDisplayCommand>()
-        val dispatcher = BlockingWriterDispatcher()
-        val publisher = publisher(commands, dispatcher)
-        publisher.startEpoch()
-
-        publisher.publishToolStart("read_file", mapOf("path" to "/tmp/x"))
-        publisher.publishToolGenerating("read_file")
-        publisher.publishToolProgress("read_file", "untrusted preview")
-        publisher.publishToolComplete("read_file")
-        publisher.publishToolRisk("read_file")
-
-        dispatcher.release()
-
-        val texts = visibleTexts(commands)
-        assertEquals(5, texts.size)
-        assertTrue(texts[0].contains("Starting"))
-        assertTrue(texts[1].contains("Preparing"))
-        assertTrue(texts[2].contains("Running"))
-        assertTrue(texts[3].contains("Completed"))
-        assertTrue(texts[4].contains("redacted"))
-        publisher.close()
-    }
-
-    @Test
-    fun finalDiscardsPendingPartialButFollowsQueuedToolTransition() {
-        val commands = mutableListOf<MyvuDisplayCommand>()
-        val dispatcher = BlockingWriterDispatcher()
-        val publisher = publisher(commands, dispatcher)
-        publisher.startEpoch()
-
-        publisher.publishToken("Partial")
-        publisher.publishToolStart("read_file", mapOf("path" to "/tmp/x"))
-        publisher.publishFinal("Final")
-
-        dispatcher.release()
-
-        val texts = visibleTexts(commands)
-        assertEquals(2, texts.size)
-        assertTrue(texts.single { it.contains("Starting") }.contains("/tmp/x"))
-        assertEquals("Final", texts.last())
-        publisher.close()
-    }
-
-    @Test
-    fun finalFencesTheScheduledPartialUpdate() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
-            publisher.startEpoch()
-            publisher.publishToken("First")
-            runCurrent()
-            publisher.publishToken(" stale")
-
-            publisher.publishFinal("Final")
-            advanceTimeBy(200)
-            advanceUntilIdle()
-
-            assertEquals(listOf("First", "Final"), visibleTexts(commands))
-            publisher.close()
-        }
-
-    @Test
-    fun toolDetailsAreAllowlistedAndProgressNeverExposesPreview() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
-            publisher.startEpoch()
-
-            publisher.publishToolStart("read_file", mapOf("path" to "/safe/path", "token" to "secret"))
-            advanceUntilIdle()
-            assertTrue(visibleTexts(commands).last().contains("/safe/path"))
-
-            publisher.publishToolProgress("read_file", "api-key=leaked")
-            advanceUntilIdle()
-
-            val text = visibleTexts(commands).last()
-            assertTrue(text.contains("• read_file"))
-            assertTrue(text.contains("Running"))
-            assertFalse(text.contains("api-key"))
-            assertFalse(text.contains("secret"))
-            publisher.close()
-        }
-
-    @Test
-    fun terminalAndUnknownToolArgumentsNeverReachGlasses() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
-            publisher.startEpoch()
-
-            publisher.publishToolStart("terminal", mapOf("command" to "cat ~/.ssh/id_rsa"))
-            publisher.publishToolStart("unknown", mapOf("value" to "private value"))
-            advanceUntilIdle()
-
-            val text = visibleTexts(commands).last()
-            assertFalse(text.contains("id_rsa"))
-            assertFalse(text.contains("private value"))
-            publisher.close()
-        }
-
-    @Test
-    fun closeMakesPendingAndLaterWritesInert() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
-            publisher.startEpoch()
-            publisher.publishToken("Partial")
-            publisher.close()
-            advanceUntilIdle()
-
-            assertTrue(commands.isEmpty())
-        }
-
-    @Test
-    fun staleQueuedGenerationNeverRenders() =
-        runTest {
-            val commands = mutableListOf<MyvuDisplayCommand>()
-            val publisher = publisher(commands, StandardTestDispatcher(testScheduler))
-            publisher.startEpoch()
-
-            publisher.enqueueStaleIntent("stale")
-            runCurrent()
-
-            assertTrue(commands.isEmpty())
-            publisher.close()
-        }
-
-    @Suppress("UNCHECKED_CAST")
-    private fun MyvuTurnStreamPublisher.enqueueStaleIntent(text: String) {
-        val publisherClass = javaClass
-        val generation =
-            publisherClass
-                .getDeclaredField("generation")
-                .apply { isAccessible = true }
-                .getLong(this)
-        val intentClass = publisherClass.declaredClasses.single { it.simpleName == "RenderIntent" }
-        val initialDocumentPhase =
-            publisherClass
-                .declaredClasses
-                .single { it.simpleName == "DocumentPhase" }
-                .enumConstants
-                .first()
-        val staleIntent =
-            intentClass.declaredConstructors
-                .single { it.parameterTypes.size == 6 }
-                .apply { isAccessible = true }
-                .newInstance(generation - 1, text, initialDocumentPhase, false, false, null)
-        val intents =
-            publisherClass
-                .getDeclaredField("intents")
-                .apply { isAccessible = true }
-                .get(this) as kotlin.collections.ArrayDeque<Any>
-        val wakeups =
-            publisherClass
-                .getDeclaredField("writerWakeups")
-                .apply { isAccessible = true }
-                .get(this) as Channel<Unit>
-
-        intents.addLast(staleIntent)
-        wakeups.trySend(Unit).getOrThrow()
-    }
-
     private fun publisher(
         commands: MutableList<MyvuDisplayCommand>,
         dispatcher: CoroutineDispatcher,
         readability: () -> GlassesReadability = { GlassesReadability() },
-        documentId: () -> String = { "document" },
+        documentId: (() -> String)? = null,
     ): MyvuTurnStreamPublisher =
         MyvuTurnStreamPublisher(
-            renderer = MyvuDisplayRenderer(documentId = documentId),
+            renderer =
+                documentId?.let { MyvuDisplayRenderer(documentId = it) }
+                    ?: MyvuDisplayRenderer(),
             readability = readability,
             writer = MyvuCommandWriter { commands += it },
             writerDispatcher = dispatcher,
@@ -598,20 +396,26 @@ class MyvuTurnStreamPublisherTest {
 
     private fun textWithLines(lines: Int): String = List(lines) { "x" }.joinToString("\n")
 
-    private fun responseDocumentKeys(commands: List<MyvuDisplayCommand>): List<String> =
-        commands.filter { it.payload.contains("send_content") }.map { it.documentKey }
+    private fun contentCommands(commands: List<MyvuDisplayCommand>): List<MyvuDisplayCommand> =
+        commands.filter { it.payload.contains("send_content") }
+
+    private fun contentDocumentKeys(commands: List<MyvuDisplayCommand>): List<String> =
+        contentCommands(commands).map { it.documentKey }
 
     private fun visibleTexts(commands: List<MyvuDisplayCommand>): List<String> =
-        commands
-            .filter { it.payload.contains("send_content") }
-            .map { command ->
-                val outer = Json.parseToJsonElement(command.payload).jsonObject
-                val inner =
-                    Json.parseToJsonElement(
-                        outer["data"]!!.jsonObject["value"]!!.jsonPrimitive.content,
-                    ).jsonObject
-                inner["sourceText"]!!.jsonPrimitive.content
-            }
+        contentCommands(commands).map(::sourceText)
+
+    private fun sourceText(command: MyvuDisplayCommand): String {
+        val outer = Json.parseToJsonElement(command.payload).jsonObject
+        val content = Json.parseToJsonElement(outer["data"]!!.jsonObject["value"]!!.jsonPrimitive.content).jsonObject
+        return content["sourceText"]!!.jsonPrimitive.content
+    }
+
+    private fun messageId(command: MyvuDisplayCommand): String {
+        val outer = Json.parseToJsonElement(command.payload).jsonObject
+        val content = Json.parseToJsonElement(outer["data"]!!.jsonObject["value"]!!.jsonPrimitive.content).jsonObject
+        return content["msgId"]!!.jsonPrimitive.content
+    }
 
     private fun commandActions(commands: List<MyvuDisplayCommand>): List<String> =
         commands.map { command ->

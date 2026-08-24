@@ -1,6 +1,5 @@
 package com.m57.hermescontrol.glasses.service
 
-import com.m57.hermescontrol.glasses.myvu.DisplayKind
 import com.m57.hermescontrol.glasses.myvu.GlassesFontMode
 import com.m57.hermescontrol.glasses.myvu.GlassesReadability
 import com.m57.hermescontrol.glasses.myvu.MyvuDisplayCommand
@@ -50,8 +49,8 @@ internal interface MyvuTurnPublisher {
 }
 
 /**
- * Conservative ED70 teleprompter geometry used to decide when a refreshed
- * response needs a new document identity to start MYVU scrolling.
+ * Conservative ED70 teleprompter geometry used to decide when buffered prose
+ * is long enough to open the response document and begin MYVU scrolling.
  *
  * The device exposes no page-overflow signal. These named estimates deliberately
  * leave a one-wrapped-line margin after the visible page and are the single place
@@ -162,8 +161,8 @@ internal class MyvuTurnStreamPublisher(
     writerDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : MyvuTurnPublisher {
     private enum class DocumentPhase {
-        Initial,
-        Scrolling,
+        Thinking,
+        Response,
     }
 
     private data class RenderIntent(
@@ -182,10 +181,9 @@ internal class MyvuTurnStreamPublisher(
     private var generation = 0L
     private var epochOpen = false
     private var finalQueued = false
-    private var scrollingRekeyRequested = false
+    private var responseRequested = false
     private val assistantText = StringBuilder()
     private var toolLine: String? = null
-    private var projectionQueued = false
     private var pendingPartial: Job? = null
 
     init {
@@ -198,38 +196,33 @@ internal class MyvuTurnStreamPublisher(
                         synchronized(stateLock) {
                             if (intents.isEmpty()) null else intents.removeFirst()
                         } ?: break
-                    val shouldRender =
-                        synchronized(stateLock) {
-                            intent.generation == generation && epochOpen
-                        }
-                    if (!shouldRender) continue
+                    if (!isCurrentIntent(intent)) continue
 
                     val opensDocument =
                         openedGeneration != intent.generation || openedDocumentPhase != intent.documentPhase
                     val commands =
                         if (opensDocument) {
-                            renderer.commandsFor(intent.text, DisplayKind.Response, readability())
+                            when (intent.documentPhase) {
+                                DocumentPhase.Thinking -> renderer.openThinking(intent.text, readability())
+                                DocumentPhase.Response -> renderer.openResponse(intent.text, readability())
+                            }
                         } else {
-                            renderer.updateResponse(intent.text)
+                            when (intent.documentPhase) {
+                                DocumentPhase.Thinking -> renderer.updateThinking(intent.text)
+                                DocumentPhase.Response -> renderer.updateResponse(intent.text)
+                            }
                         }
-                    var deliveredWholeSequence = true
-                    for (command in commands) {
-                        if (!isCurrentIntent(intent)) {
-                            deliveredWholeSequence = false
-                            break
+                    commands.forEach(writer::send)
+                    val claimedFinalCallback =
+                        synchronized(stateLock) {
+                            val isCurrent = intent.generation == generation && epochOpen
+                            if (opensDocument && isCurrent) {
+                                openedGeneration = intent.generation
+                                openedDocumentPhase = intent.documentPhase
+                            }
+                            if (intent.isFinal && isCurrent) intent.afterDelivery else null
                         }
-                        writer.send(command)
-                    }
-                    if (opensDocument && deliveredWholeSequence) {
-                        openedGeneration = intent.generation
-                        openedDocumentPhase = intent.documentPhase
-                    }
-
-                    val shouldDeliverFinal =
-                        intent.isFinal &&
-                            deliveredWholeSequence &&
-                            isCurrentIntent(intent)
-                    if (shouldDeliverFinal) intent.afterDelivery?.invoke()
+                    claimedFinalCallback?.invoke()
                 }
             }
         }
@@ -240,12 +233,12 @@ internal class MyvuTurnStreamPublisher(
             generation += 1
             epochOpen = true
             finalQueued = false
-            scrollingRekeyRequested = false
+            responseRequested = false
             assistantText.clear()
             toolLine = null
-            projectionQueued = false
             cancelPendingPartialLocked()
             intents.clear()
+            enqueueLocked(text = THINKING_TEXT, documentPhase = DocumentPhase.Thinking)
         }
     }
 
@@ -255,14 +248,10 @@ internal class MyvuTurnStreamPublisher(
             if (!epochOpen || finalQueued) return
             assistantText.append(token)
             toolLine = null
-            if (crossesOverflowMarginLocked()) {
-                scrollingRekeyRequested = true
-                cancelPendingPartialLocked()
-                intents.clear()
-                enqueueCurrentLocked()
-            } else if (!projectionQueued) {
-                enqueuePartialLocked()
-                projectionQueued = true
+            if (!responseRequested) {
+                if (MyvuResponsePageLayout.isBeyondOverflowMargin(assistantText, readability().fontMode)) {
+                    requestResponseLocked(assistantText.toString())
+                }
             } else {
                 schedulePartialLocked()
             }
@@ -272,23 +261,16 @@ internal class MyvuTurnStreamPublisher(
     override fun publishToolStart(
         name: String?,
         data: Map<String, Any?>?,
-    ) {
-        synchronized(stateLock) {
-            if (!epochOpen || finalQueued) return
-            cancelPendingPartialLocked()
-            toolLine = formatTool(name, data, "Starting")
-            enqueueCurrentLocked()
-        }
-    }
+    ) = publishToolStatus(name, data, "Starting")
 
-    override fun publishToolGenerating(name: String?) = publishToolStatus(name, "Preparing")
+    override fun publishToolGenerating(name: String?) = publishToolStatus(name, null, "Preparing")
 
     override fun publishToolProgress(
         name: String?,
         @Suppress("UNUSED_PARAMETER") preview: String?,
-    ) = publishToolStatus(name, "Running")
+    ) = publishToolStatus(name, null, "Running")
 
-    override fun publishToolComplete(name: String?) = publishToolStatus(name, "Completed")
+    override fun publishToolComplete(name: String?) = publishToolStatus(name, null, "Completed")
 
     override fun publishToolRisk(
         @Suppress("UNUSED_PARAMETER") name: String?,
@@ -309,14 +291,15 @@ internal class MyvuTurnStreamPublisher(
         synchronized(stateLock) {
             if (!epochOpen || finalQueued) return
             finalQueued = true
-            if (projectedTextLocked() != null && crossesOverflowMarginLocked(text)) {
-                scrollingRekeyRequested = true
-                cancelPendingPartialLocked()
-                intents.clear()
-            } else {
-                intents.removeAll { it.isPartial }
-            }
-            enqueueLocked(text, isFinal = true, afterDelivery = afterDelivery)
+            cancelPendingPartialLocked()
+            intents.removeAll { it.documentPhase == DocumentPhase.Response }
+            responseRequested = true
+            enqueueLocked(
+                text = text,
+                documentPhase = DocumentPhase.Response,
+                isFinal = true,
+                afterDelivery = afterDelivery,
+            )
         }
     }
 
@@ -337,12 +320,13 @@ internal class MyvuTurnStreamPublisher(
 
     private fun publishToolStatus(
         name: String?,
+        data: Map<String, Any?>?,
         status: String,
     ) {
         synchronized(stateLock) {
             if (!epochOpen || finalQueued) return
             cancelPendingPartialLocked()
-            toolLine = formatTool(name, null, status)
+            toolLine = formatTool(name, data, status)
             enqueueCurrentLocked()
         }
     }
@@ -362,52 +346,56 @@ internal class MyvuTurnStreamPublisher(
                     if (
                         scheduledGeneration != generation ||
                         !epochOpen ||
-                        finalQueued
+                        finalQueued ||
+                        !responseRequested
                     ) {
                         return@synchronized
                     }
                     pendingPartial = null
-                    enqueuePartialLocked()
+                    enqueueLocked(
+                        text = responseTextLocked(),
+                        documentPhase = DocumentPhase.Response,
+                        isPartial = true,
+                    )
                 }
             }
     }
 
-    private fun crossesOverflowMarginLocked(text: CharSequence = assistantText): Boolean =
-        !scrollingRekeyRequested &&
-            MyvuResponsePageLayout.isBeyondOverflowMargin(text, readability().fontMode)
-
-    private fun documentPhaseLocked(): DocumentPhase =
-        if (scrollingRekeyRequested) DocumentPhase.Scrolling else DocumentPhase.Initial
-
-    private fun enqueueCurrentLocked() {
-        projectedTextLocked()?.let { enqueueLocked(it) }
+    private fun requestResponseLocked(text: String) {
+        check(!responseRequested)
+        responseRequested = true
+        cancelPendingPartialLocked()
+        enqueueLocked(text = text, documentPhase = DocumentPhase.Response)
     }
 
-    private fun enqueuePartialLocked() {
-        val text = projectedTextLocked() ?: return
-        intents.removeAll { it.isPartial }
-        intents.addLast(
-            RenderIntent(
-                generation = generation,
-                text = text,
-                documentPhase = documentPhaseLocked(),
-                isPartial = true,
-            ),
-        )
-        writerWakeups.trySend(Unit)
+    private fun enqueueCurrentLocked() {
+        if (responseRequested) {
+            enqueueLocked(text = responseTextLocked(), documentPhase = DocumentPhase.Response)
+        } else {
+            enqueueLocked(text = thinkingTextLocked(), documentPhase = DocumentPhase.Thinking)
+        }
     }
 
     private fun enqueueLocked(
         text: String,
+        documentPhase: DocumentPhase,
+        isPartial: Boolean = false,
         isFinal: Boolean = false,
         afterDelivery: (() -> Unit)? = null,
     ) {
-        if (isFinal || intents.count { !it.isPartial } < MAX_PENDING_CONTROL_INTENTS) {
+        if (
+            isPartial ||
+            isFinal ||
+            documentPhase == DocumentPhase.Response ||
+            intents.count { !it.isPartial } < MAX_PENDING_THINKING_INTENTS
+        ) {
+            if (isPartial) intents.removeAll { it.isPartial }
             intents.addLast(
                 RenderIntent(
                     generation = generation,
                     text = text,
-                    documentPhase = documentPhaseLocked(),
+                    documentPhase = documentPhase,
+                    isPartial = isPartial,
                     isFinal = isFinal,
                     afterDelivery = afterDelivery,
                 ),
@@ -416,11 +404,12 @@ internal class MyvuTurnStreamPublisher(
         }
     }
 
-    private fun projectedTextLocked(): String? =
+    private fun thinkingTextLocked(): String = toolLine?.let { "$THINKING_TEXT\n\n$it" } ?: THINKING_TEXT
+
+    private fun responseTextLocked(): String =
         when {
-            assistantText.isNotEmpty() && toolLine != null -> "$assistantText\n\n$toolLine"
-            assistantText.isNotEmpty() -> assistantText.toString()
-            else -> toolLine
+            toolLine != null -> "$assistantText\n\n$toolLine"
+            else -> assistantText.toString()
         }
 
     private fun formatTool(
@@ -453,8 +442,9 @@ internal class MyvuTurnStreamPublisher(
     }
 
     private companion object {
+        const val THINKING_TEXT = "Thinking"
         const val PARTIAL_UPDATE_MILLIS = 200L
-        const val MAX_PENDING_CONTROL_INTENTS = 128
+        const val MAX_PENDING_THINKING_INTENTS = 128
         const val MAX_DETAIL_LENGTH = 240
         val SECRET_PATTERN = Regex("(?i)(api[_-]?key|token|secret|password|authorization|bearer)")
         val SAFE_DETAIL_KEYS =

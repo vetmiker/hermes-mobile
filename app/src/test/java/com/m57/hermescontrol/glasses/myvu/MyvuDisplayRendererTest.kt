@@ -2,6 +2,7 @@ package com.m57.hermescontrol.glasses.myvu
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
@@ -32,6 +33,21 @@ class MyvuDisplayRendererTest {
 
         assertEquals(initial[0].documentKey, status[0].documentKey)
         assertNotEquals(initial[0].documentKey, later[0].documentKey)
+    }
+
+    @Test
+    fun thinkingAndResponseEachMintOneIdentity() {
+        var documentNumber = 0
+        val renderer = MyvuDisplayRenderer(documentId = { "document-${++documentNumber}" })
+
+        val thinking = renderer.openThinking("Thinking", GlassesReadability())
+        val thinkingUpdate = renderer.updateThinking("Thinking\n\n• read_file — Running")
+        val response = renderer.openResponse("Response", GlassesReadability())
+
+        assertEquals(thinking[0].documentKey, thinkingUpdate[0].documentKey)
+        assertEquals(messageId(thinking[0]), messageId(thinkingUpdate[1]))
+        assertNotEquals(thinking[0].documentKey, response[0].documentKey)
+        assertNotEquals(messageId(thinking[0]), messageId(response[0]))
     }
 
     @Test
@@ -81,6 +97,8 @@ class MyvuDisplayRendererTest {
         assertEquals(2, update.size)
         assertEquals(opened[0].documentKey, update[0].documentKey)
         assertEquals(update[0].documentKey, update[1].documentKey)
+        assertEquals(messageId(opened[0]), messageId(update[0]))
+        assertEquals(messageId(update[0]), messageId(update[1]))
         assertEquals(
             "open_app",
             Json.parseToJsonElement(update[0].payload).jsonObject["data"]!!.jsonObject["action"]
@@ -98,5 +116,17 @@ class MyvuDisplayRendererTest {
         assertTrue(update[1].payload.contains("\\\"fileKey\\\":\\\"doc/hermes-agent\\\""))
         assertTrue(update[1].payload.contains("Partial answer"))
         assertTrue(update.none { it.fontMode != null })
+    }
+
+    private fun messageId(command: MyvuDisplayCommand): String {
+        val outer = Json.parseToJsonElement(command.payload).jsonObject
+        val data = outer["data"]!!.jsonObject
+        val payload =
+            if (data["action"]!!.jsonPrimitive.content == "open_app") {
+                data["ext"]!!.jsonPrimitive.content
+            } else {
+                data["value"]!!.jsonPrimitive.content
+            }
+        return Json.parseToJsonElement(payload).jsonObject["msgId"]!!.jsonPrimitive.content
     }
 }
