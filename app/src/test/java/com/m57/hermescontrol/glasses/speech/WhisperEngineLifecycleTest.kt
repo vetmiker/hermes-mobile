@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -66,6 +67,172 @@ class WhisperEngineLifecycleTest {
         assertTrue(completed.await(2, TimeUnit.SECONDS))
         assertSame(native.vadInputs[0], native.vadInputs[1])
         engine.close()
+    }
+
+    @Test
+    fun warm_up_processes_a_silent_window_resets_vad_then_reports_success() {
+        val events = Collections.synchronizedList(mutableListOf<String>())
+        val native = WarmUpNative(events)
+        val engine = WhisperEngine(native = native)
+        val opened = CountDownLatch(1)
+        val warmedUp = CountDownLatch(1)
+
+        engine.open(WhisperModelStore.ReadyModels("whisper", "vad")) {
+            events += "open callback"
+            opened.countDown()
+        }
+        assertTrue(opened.await(2, TimeUnit.SECONDS))
+        engine.warmUpVad {
+            assertTrue(it.isSuccess)
+            events += "warm-up callback"
+            warmedUp.countDown()
+        }
+
+        assertTrue(warmedUp.await(2, TimeUnit.SECONDS))
+        assertEquals(
+            listOf("open", "open callback", "vad:512", "reset", "warm-up callback"),
+            events,
+        )
+        assertTrue(native.samples.all { it == 0f })
+        assertEquals(setOf("myvu-whisper"), native.operationThreads.toSet())
+        engine.close()
+    }
+
+    @Test
+    fun warm_up_fails_without_reset_when_native_vad_does_not_process() {
+        val native = WarmUpNative(mutableListOf(), processed = false)
+        val engine = WhisperEngine(native = native)
+        val opened = CountDownLatch(1)
+        var result: Result<Unit>? = null
+        val completed = CountDownLatch(1)
+
+        engine.open(WhisperModelStore.ReadyModels("whisper", "vad")) { opened.countDown() }
+        assertTrue(opened.await(2, TimeUnit.SECONDS))
+        engine.warmUpVad {
+            result = it
+            completed.countDown()
+        }
+
+        assertTrue(completed.await(2, TimeUnit.SECONDS))
+        assertTrue(result?.isFailure == true)
+        assertEquals(0, native.resetCalls)
+        engine.close()
+    }
+
+    @Test
+    fun cancellation_suppresses_warm_up_callback() {
+        val native = BlockingWarmUpNative()
+        val engine = WhisperEngine(native = native)
+        val opened = CountDownLatch(1)
+        val callback = CountDownLatch(1)
+
+        engine.open(WhisperModelStore.ReadyModels("whisper", "vad")) { opened.countDown() }
+        assertTrue(opened.await(2, TimeUnit.SECONDS))
+        engine.warmUpVad { callback.countDown() }
+        assertTrue(native.vadStarted.await(2, TimeUnit.SECONDS))
+        engine.cancel()
+        native.releaseVad.countDown()
+
+        assertFalse(callback.await(200, TimeUnit.MILLISECONDS))
+        engine.close()
+    }
+
+    @Test
+    fun configures_audio_thread_priority_before_native_open() {
+        val events = Collections.synchronizedList(mutableListOf<String>())
+        val engine =
+            WhisperEngine(
+                native = WarmUpNative(events),
+                configureThreadPriority = { events += "priority" },
+            )
+        val opened = CountDownLatch(1)
+
+        engine.open(WhisperModelStore.ReadyModels("whisper", "vad")) { opened.countDown() }
+
+        assertTrue(opened.await(2, TimeUnit.SECONDS))
+        assertEquals(listOf("priority", "open"), events.take(2))
+        engine.close()
+    }
+
+    private class WarmUpNative(
+        private val events: MutableList<String>,
+        private val processed: Boolean = true,
+    ) : WhisperNativeBridge {
+        lateinit var samples: FloatArray
+        val operationThreads = Collections.synchronizedList(mutableListOf<String>())
+        var resetCalls = 0
+
+        override fun version() = "v1.9.3"
+
+        override fun open(
+            whisperModelPath: String,
+            vadModelPath: String,
+            threads: Int,
+        ): Long {
+            operationThreads += Thread.currentThread().name
+            events += "open"
+            return 1L
+        }
+
+        override fun close(handle: Long) = Unit
+
+        override fun cancel(handle: Long) = Unit
+
+        override fun resetVad(handle: Long) {
+            operationThreads += Thread.currentThread().name
+            resetCalls += 1
+            events += "reset"
+        }
+
+        override fun vadProbability(
+            handle: Long,
+            samples: FloatArray,
+        ): WhisperNative.VadResult {
+            operationThreads += Thread.currentThread().name
+            this.samples = samples.copyOf()
+            events += "vad:${samples.size}"
+            return WhisperNative.VadResult(processed = processed, probability = 0f)
+        }
+
+        override fun transcribe(
+            handle: Long,
+            samples: FloatArray,
+            threads: Int,
+        ) = ""
+    }
+
+    private class BlockingWarmUpNative : WhisperNativeBridge {
+        val vadStarted = CountDownLatch(1)
+        val releaseVad = CountDownLatch(1)
+
+        override fun version() = "v1.9.3"
+
+        override fun open(
+            whisperModelPath: String,
+            vadModelPath: String,
+            threads: Int,
+        ) = 1L
+
+        override fun close(handle: Long) = Unit
+
+        override fun cancel(handle: Long) = Unit
+
+        override fun resetVad(handle: Long) = Unit
+
+        override fun vadProbability(
+            handle: Long,
+            samples: FloatArray,
+        ): WhisperNative.VadResult {
+            vadStarted.countDown()
+            check(releaseVad.await(2, TimeUnit.SECONDS))
+            return WhisperNative.VadResult(processed = true, probability = 0f)
+        }
+
+        override fun transcribe(
+            handle: Long,
+            samples: FloatArray,
+            threads: Int,
+        ) = ""
     }
 
     private class BlockingOpenNative : WhisperNativeBridge {

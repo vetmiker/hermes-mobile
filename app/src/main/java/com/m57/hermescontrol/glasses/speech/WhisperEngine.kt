@@ -1,5 +1,6 @@
 package com.m57.hermescontrol.glasses.speech
 
+import android.os.Process
 import java.io.Closeable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -9,6 +10,8 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 internal interface SpeechEngine : Closeable {
+    fun warmUpVad(onResult: (Result<Unit>) -> Unit)
+
     fun vad(
         pcm: ByteArray,
         onResult: (Result<WhisperNative.VadResult>) -> Unit,
@@ -28,15 +31,25 @@ internal interface SpeechEngine : Closeable {
 internal class WhisperEngine(
     private val threads: Int = 3,
     private val native: WhisperNativeBridge = WhisperNative,
+    private val configureThreadPriority: () -> Unit = {
+        runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) }
+    },
 ) : SpeechEngine {
     private val executor: ExecutorService =
         Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "myvu-whisper").apply { isDaemon = true }
+            Thread(
+                {
+                    configureThreadPriority()
+                    runnable.run()
+                },
+                "myvu-whisper",
+            ).apply { isDaemon = true }
         }
     private val handle = AtomicReference<Long?>(null)
     private val cancellationEpoch = AtomicLong(0)
     private val closed = AtomicBoolean(false)
     private val vadSamples = FloatArray(VAD_WINDOW_SAMPLES)
+    private val warmUpSamples = FloatArray(VAD_WINDOW_SAMPLES)
 
     fun open(
         models: WhisperModelStore.ReadyModels,
@@ -49,6 +62,22 @@ internal class WhisperEngine(
                     handle.set(native.open(models.whisperPath, models.vadPath, threads))
                 }
             if (!closed.get()) onResult(result)
+        }
+    }
+
+    override fun warmUpVad(onResult: (Result<Unit>) -> Unit) {
+        val requestedEpoch = cancellationEpoch.get()
+        submit {
+            val result =
+                runCatching {
+                    check(requestedEpoch == cancellationEpoch.get()) { "Whisper work cancelled" }
+                    check(
+                        native.vadProbability(checkNotNull(handle.get()), warmUpSamples).processed,
+                    ) { "Native VAD processing failed during warm-up" }
+                    native.resetVad(checkNotNull(handle.get()))
+                    check(requestedEpoch == cancellationEpoch.get()) { "Whisper work cancelled" }
+                }
+            if (!closed.get() && requestedEpoch == cancellationEpoch.get()) onResult(result)
         }
     }
 

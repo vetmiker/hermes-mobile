@@ -106,6 +106,28 @@ internal class MyvuPreparationSessionGate {
     }
 }
 
+internal suspend fun awaitSpeechStartup(
+    warmUpVad: ((Result<Unit>) -> Unit) -> Unit,
+    onSessionLoaded: () -> Boolean,
+    onStartCapture: () -> Unit,
+    onAbort: () -> Unit,
+) {
+    suspendCancellableCoroutine { continuation ->
+        warmUpVad { result ->
+            if (continuation.isActive) {
+                result
+                    .onSuccess { continuation.resume(Unit) }
+                    .onFailure {
+                        onAbort()
+                        continuation.resumeWithException(it)
+                    }
+            }
+        }
+        continuation.invokeOnCancellation { onAbort() }
+    }
+    if (onSessionLoaded()) onStartCapture() else onAbort()
+}
+
 internal suspend fun terminalLeaseReleased(
     snapshot: GlassesModeSnapshot,
     voiceLease: TurnLease?,
@@ -235,7 +257,7 @@ class MyvuGlassesService : Service() {
                 render(initialDisplay, DisplayKind.Context)
                 val models =
                     try {
-                        WhisperModelStore(applicationContext).prepare { showPreparation(preparation, it) }
+                        WhisperModelStore(applicationContext).prepare()
                     } catch (cancellation: CancellationException) {
                         throw cancellation
                     } catch (error: Throwable) {
@@ -256,23 +278,44 @@ class MyvuGlassesService : Service() {
                     }
                     return@launch
                 }
-                if (!ownsPreparation(preparation)) {
-                    localEngine.close()
-                    return@launch
-                }
-                engine = localEngine
-                if (!GlassesModeControllerProvider.controller.initialDisplayCompleted(
-                        starting.generation,
-                        storedSessionId,
-                        runtimeSessionId,
+                try {
+                    awaitSpeechStartup(
+                        warmUpVad = localEngine::warmUpVad,
+                        onSessionLoaded = {
+                            if (!ownsPreparation(preparation)) {
+                                false
+                            } else if (!GlassesModeControllerProvider.controller.initialDisplayCompleted(
+                                    starting.generation,
+                                    storedSessionId,
+                                    runtimeSessionId,
+                                )
+                            ) {
+                                false
+                            } else if (!ownsPreparation(preparation)) {
+                                false
+                            } else {
+                                val sessionLoaded =
+                                    getString(R.string.myvu_audio_session_loaded_text)
+                                render(sessionLoaded, DisplayKind.Status)
+                                promoteToForeground(sessionLoaded)
+                                engine = localEngine
+                                true
+                            }
+                        },
+                        onStartCapture = {
+                            resumeCapture(scope)
+                            observeSession(scope, currentTransport)
+                        },
+                        onAbort = localEngine::close,
                     )
-                ) {
-                    return@launch
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (error: Throwable) {
+                    localEngine.close()
+                    if (ownsPreparation(preparation)) {
+                        preparationFailed(preparation, error.message ?: "Native model load failed")
+                    }
                 }
-                if (!ownsPreparation(preparation)) return@launch
-                promoteToForeground(getString(R.string.myvu_audio_listening_text))
-                resumeCapture(scope)
-                observeSession(scope, currentTransport)
             } catch (cancellation: CancellationException) {
                 throw cancellation
             }
@@ -601,17 +644,6 @@ class MyvuGlassesService : Service() {
     ) {
         val currentTransport = transport ?: return
         renderer.commandsFor(text, kind, GlassesReadabilityStore.readability.value).forEach(currentTransport::send)
-    }
-
-    private fun showPreparation(
-        preparation: MyvuPreparationSessionGate.Session,
-        text: String,
-    ) {
-        serviceScope.launch {
-            if (!ownsPreparation(preparation)) return@launch
-            render(text, DisplayKind.Status)
-            promoteToForeground(text)
-        }
     }
 
     private fun ownsPreparation(preparation: MyvuPreparationSessionGate.Session): Boolean {

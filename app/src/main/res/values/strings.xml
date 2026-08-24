@@ -1175,7 +1175,7 @@
     <string name="myvu_audio_channel_name">MYVU glasses microphone</string>
     <string name="myvu_audio_notification_title">MYVU glasses mode</string>
     <string name="myvu_audio_preparing_text">Preparing on-device speech models</string>
-    <string name="myvu_audio_listening_text">Listening with on-device speech recognition</string>
+    <string name="myvu_audio_session_loaded_text">Session loaded</string>
     <string name="myvu_audio_suspended_text">Local speech capture suspended</string>
     <string name="myvu_audio_error_text">On-device speech preparation failed; tap glasses mode to retry</string>
     <string name="glasses_action_start">Start glasses mode</string>
