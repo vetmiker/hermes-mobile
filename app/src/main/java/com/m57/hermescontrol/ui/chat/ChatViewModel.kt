@@ -14,16 +14,12 @@ import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.local.HermesDatabase
 import com.m57.hermescontrol.data.local.SlashUsageStore
 import com.m57.hermescontrol.data.model.Attachment
-import com.m57.hermescontrol.data.model.AttachmentSource
+import com.m57.hermescontrol.data.model.ModelCapabilities
 import com.m57.hermescontrol.data.model.ModelProvider
 import com.m57.hermescontrol.data.model.PinnedModel
-import com.m57.hermescontrol.data.model.SessionMessage
 import com.m57.hermescontrol.data.model.parseContextBreakdown
 import com.m57.hermescontrol.data.model.parseUsageSnapshot
 import com.m57.hermescontrol.data.remote.ApiClient
-import com.m57.hermescontrol.data.remote.GatewayFile
-import com.m57.hermescontrol.data.remote.GatewayFileClient
-import com.m57.hermescontrol.data.remote.GatewayFileResult
 import com.m57.hermescontrol.data.remote.NetworkResult
 import com.m57.hermescontrol.data.remote.OkHttpProvider
 import com.m57.hermescontrol.data.remote.safeApiCall
@@ -41,11 +37,13 @@ import com.m57.hermescontrol.glasses.GlassesModeControllerProvider
 import com.m57.hermescontrol.glasses.GlassesModeState
 import com.m57.hermescontrol.glasses.TurnRequest
 import com.m57.hermescontrol.glasses.TurnSource
+import com.m57.hermescontrol.glasses.VoiceTranscriptUiEvent
 import com.m57.hermescontrol.glasses.service.MyvuGlassesService
 import com.m57.hermescontrol.ui.common.ActionProgressController
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -150,6 +148,20 @@ internal fun sameLogicalMessage(
     val ta = a.content.trim()
     val tb = b.content.trim()
     if (ta == tb) return true
+    // Attachment dedupe: when the user sends an image/file, the backend
+    // persists an ENRICHED copy of the prompt — the real caption plus
+    // `@image:`/`@file:` reference lines and a `[screenshot]` marker
+    // (tui_gateway _build_image_ref_message / run_agent flattening). The
+    // optimistic bubble carries the raw caption only, so the exact compare
+    // above fails and the REST sync renders the same message twice. Compare
+    // USER rows on the caption with injection lines stripped (both sides —
+    // stripping a clean string is a no-op). USER-only so assistant text that
+    // legitimately mentions these tokens is never collapsed.
+    if (a.role == MessageRole.USER) {
+        val ca = stripAttachmentRefLines(ta)
+        val cb = stripAttachmentRefLines(tb)
+        if (ca == cb) return true
+    }
     // Issue #842: a seal race can leave the live orphan a few trailing tokens
     // short of the streamed narration (the last delta was still in the
     // throttled buffer when tool.start sealed the message). The backend
@@ -161,6 +173,25 @@ internal fun sameLogicalMessage(
         tb.length >= 40 &&
         (tb.startsWith(ta) || ta.startsWith(tb))
 }
+
+/**
+ * Remove backend attachment-injection lines from a user message so the
+ * optimistic bubble and the server-enriched REST copy compare equal.
+ * Lines the gateway adds on top of the user's caption: `@image:<path>`,
+ * `@file:<ref>`, and `[screenshot]` (multipart image placeholder written by
+ * run_agent). Blank lines left behind are dropped too.
+ */
+internal fun stripAttachmentRefLines(content: String): String =
+    content
+        .lines()
+        .map { it.trim() }
+        .filterNot { line ->
+            line.startsWith("@image:") ||
+                line.startsWith("@file:") ||
+                line == "[screenshot]"
+        }
+        .joinToString("\n")
+        .trim()
 
 /**
  * Room accumulates BOTH the WS-persisted copy (UUID id, rich tool payload,
@@ -301,6 +332,9 @@ data class ChatUiState(
     val modelPickerLoading: Boolean = false,
     // Current session's active model label (provider/model), shown in the chip
     val currentSessionModel: String? = null,
+    // Per-model reasoning capabilities for the current session's model
+    // (issue #946). Null when unknown — UI offers full scale.
+    val currentModelCapabilities: ModelCapabilities? = null,
     // Reasoning effort level for the current session
     val reasoningLevel: String? = null,
     val terminalBackend: String? = null,
@@ -399,6 +433,11 @@ class ChatViewModel(
     slashUsageStore: SlashUsageStore = SlashUsageStore(application.applicationContext),
     searchDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.Default,
     private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.IO,
+    private val voiceTranscriptEvents: Flow<VoiceTranscriptUiEvent> =
+        ChatTurnCoordinatorProvider.voiceTranscriptEvents,
+    private val terminalLeaseReleaser: suspend (String, String) -> Unit = { runtimeSessionId, text ->
+        ChatTurnCoordinatorProvider.get().completeTerminalForRuntime(runtimeSessionId, text)
+    },
 ) : AndroidViewModel(application) {
     constructor(application: Application) : this(application, startCleanup = true)
 
@@ -406,6 +445,7 @@ class ChatViewModel(
     private val _uiState = MutableStateFlow(ChatUiState())
 
     private val _streamingState = MutableStateFlow(StreamingState())
+    private val optimisticVoiceTranscriptIds = ConcurrentHashMap.newKeySet<String>()
 
     /** Maps an in-flight RPC id to its method for UI error labeling. */
     private val idToMethod = ConcurrentHashMap<String, String>()
@@ -497,6 +537,14 @@ class ChatViewModel(
         get() = searchDelegate.searchState
     private val attachmentsDelegate = ChatAttachmentsDelegate(uiState = _uiState)
 
+    private val mediaDelegate =
+        ChatMediaDelegate(
+            uiState = _uiState,
+            getApplication = { getApplication() },
+            scope = viewModelScope,
+            ioDispatcher = ioDispatcher,
+        )
+
     /**
      * Model options cached from GET /api/model/options so the in-session model
      * picker (issue #589) opens instantly when the user types /model or taps the
@@ -555,6 +603,9 @@ class ChatViewModel(
                     _uiState.update { it.copy(isLoading = false) }
                 }
             }
+        }
+        viewModelScope.launch {
+            voiceTranscriptEvents.collect(::handleVoiceTranscriptUiEvent)
         }
         // B7 (Jun 30 2026, kanban t_connection_loading): clear loading state on connection failure or status change
         viewModelScope.launch {
@@ -695,6 +746,38 @@ class ChatViewModel(
         }
     }
 
+    private fun handleVoiceTranscriptUiEvent(event: VoiceTranscriptUiEvent) {
+        if (
+            event.storedSessionId != _uiState.value.currentSessionId ||
+            event.runtimeSessionId != runtimeSessionId
+        ) {
+            return
+        }
+        when (event) {
+            is VoiceTranscriptUiEvent.Published -> {
+                if (event.text.isBlank() || !optimisticVoiceTranscriptIds.add(event.utteranceId)) return
+                _uiState.update { state ->
+                    state.copy(
+                        messages =
+                            state.messages +
+                                ChatMessage(
+                                    id = event.utteranceId,
+                                    role = MessageRole.USER,
+                                    content = event.text,
+                                ),
+                    )
+                }
+            }
+
+            is VoiceTranscriptUiEvent.SubmissionFailed -> {
+                if (!optimisticVoiceTranscriptIds.remove(event.utteranceId)) return
+                _uiState.update { state ->
+                    state.copy(messages = state.messages.filterNot { it.id == event.utteranceId })
+                }
+            }
+        }
+    }
+
     private fun handleWsEvent(event: WsEvent) {
         // RpcError is reduced before ViewModel request handling. Drop stale
         // session errors here so the shared reducer cannot clear loading or
@@ -770,7 +853,7 @@ class ChatViewModel(
                     // via the gateway /api/files/download endpoint. Works on a
                     // remote phone too.
                     viewModelScope.launch(ioDispatcher) {
-                        attachHostMedia(effect.sessionId, effect.messageId)
+                        mediaDelegate.attachHostMedia(effect.sessionId, effect.messageId)
                     }
                 }
             }
@@ -820,6 +903,7 @@ class ChatViewModel(
                             fullContextTokens = if (modelSwapped) null else state.fullContextTokens,
                         )
                     }
+                    syncCurrentModelCapabilities()
                     if (modelSwapped) {
                         // Issue #817: after a swap the REST model/info window is
                         // PROFILE-scoped and may describe the old model (e.g. a
@@ -852,15 +936,15 @@ class ChatViewModel(
             }
 
             is WsEvent.MessageComplete -> {
-                // Release the process-scoped submission lease for every input
-                // source. The glasses service independently consumes voice
-                event.sessionId?.let { eventSessionId ->
-                    viewModelScope.launch(ioDispatcher) {
-                        ChatTurnCoordinatorProvider
-                            .get()
-                            .completeTerminalForRuntime(eventSessionId, event.text)
+                // A matching glasses turn owns terminal delivery until its
+                // Binder writer has displayed the final response.
+                event.sessionId
+                    ?.takeUnless(::glassesOwnsTerminalDelivery)
+                    ?.let { eventSessionId ->
+                        viewModelScope.launch(ioDispatcher) {
+                            terminalLeaseReleaser(eventSessionId, event.text)
+                        }
                     }
-                }
                 // Buffers cleared before reduce; ViewModel resets them after
                 streamingController.resetStreaming()
             }
@@ -1089,6 +1173,7 @@ class ChatViewModel(
                         terminalBackend = terminalBackend ?: it.terminalBackend,
                     )
                 }
+                syncCurrentModelCapabilities()
                 // Mirror the active runtime session id app-wide (issue #532).
                 ActiveSessionHolder.set(runtimeSessionId ?: sessionId, sessionId)
                 addSystemMessage("Session resumed")
@@ -1131,7 +1216,7 @@ class ChatViewModel(
                 val map = result as? Map<*, *>
                 val resolved = (map?.get("resolved") as? Number)?.toInt() ?: 0
                 if (resolved > 0) {
-                    addSystemMessage("✅ Approval submitted")
+                    addSystemMessage("Approval submitted")
                 }
             }
         }
@@ -1288,7 +1373,7 @@ class ChatViewModel(
         if (
             storedSessionId.isNullOrBlank() ||
             activeRuntimeSessionId.isNullOrBlank() ||
-            initialDisplay.isNullOrBlank()
+            initialDisplay == null
         ) {
             return false
         }
@@ -1297,7 +1382,11 @@ class ChatViewModel(
                 .setAction(MyvuGlassesService.ACTION_START)
                 .putExtra(MyvuGlassesService.EXTRA_STORED_SESSION_ID, storedSessionId)
                 .putExtra(MyvuGlassesService.EXTRA_RUNTIME_SESSION_ID, activeRuntimeSessionId)
-                .putExtra(MyvuGlassesService.EXTRA_INITIAL_DISPLAY, initialDisplay)
+                .putExtra(MyvuGlassesService.EXTRA_INITIAL_DISPLAY, initialDisplay.text)
+                .putExtra(
+                    MyvuGlassesService.EXTRA_INITIAL_DISPLAY_KIND,
+                    initialDisplay.kind.name,
+                )
         ContextCompat.startForegroundService(context, intent)
         return true
     }
@@ -1306,6 +1395,15 @@ class ChatViewModel(
         context.startService(
             Intent(context, MyvuGlassesService::class.java).setAction(MyvuGlassesService.ACTION_STOP),
         )
+    }
+
+    private fun glassesOwnsTerminalDelivery(runtimeSessionId: String): Boolean {
+        val snapshot = GlassesModeControllerProvider.controller.snapshot.value
+        return snapshot.runtimeSessionId == runtimeSessionId &&
+            (
+                snapshot.state == GlassesModeState.AWAITING_HERMES ||
+                    snapshot.state == GlassesModeState.PHONE_PRIORITY
+            )
     }
 
     private fun mirrorAcceptedPhoneInput(
@@ -1580,7 +1678,7 @@ class ChatViewModel(
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to upload attachment ${attachment.name}", e)
                     _uiState.update {
-                        it.copy(errorMessage = "⚠️ Upload failed: ${attachment.name}")
+                        it.copy(errorMessage = "Upload failed: ${attachment.name}")
                     }
                 }
             }
@@ -1672,6 +1770,19 @@ class ChatViewModel(
 
     fun removeAttachment(index: Int) = attachmentsDelegate.removeAttachment(index)
 
+    fun openAttachment(attachment: Attachment) = mediaDelegate.openAttachment(attachment)
+
+    fun saveAttachment(
+        attachment: Attachment,
+        destination: android.net.Uri,
+    ) = mediaDelegate.saveAttachment(attachment, destination)
+
+    fun clearOpenError() {
+        _uiState.update { it.copy(openError = null) }
+    }
+
+    fun gatewayPathFor(attachment: Attachment): String = mediaDelegate.gatewayPathFor(attachment)
+
     fun clearAttachments() = attachmentsDelegate.clearAttachments()
 
     private fun handleSlashCommand(
@@ -1703,7 +1814,7 @@ class ChatViewModel(
         // (before any RPC fires) with a clear message instead of a doomed call.
         if (CommandBlocklist.contains(command)) {
             addAssistantMessage(
-                "⚠️ ${command.split(" ", limit = 2)[0]} is not supported on mobile",
+                "${command.split(" ", limit = 2)[0]} is not supported on mobile",
             )
             return
         }
@@ -1909,11 +2020,12 @@ class ChatViewModel(
                         }
                     } catch (e2: HermesWsClient.HermesRpcException) {
                         resolveMirrorFence(mirrorFence)
-                        addAssistantMessage("⚠️ /$name: ${e2.message}")
+                        addAssistantMessage("/$name: ${e2.message}")
                     }
                 } else {
+                    // Legit error from command.dispatch (busy, no history, etc.)
                     resolveMirrorFence(mirrorFence)
-                    addAssistantMessage("⚠️ /$name: ${e.message}")
+                    addAssistantMessage("/$name: ${e.message}")
                 }
             } catch (error: Exception) {
                 resolveMirrorFence(mirrorFence)
@@ -2140,6 +2252,7 @@ class ChatViewModel(
             if (result is NetworkResult.Success) {
                 cachedModelOptions = result.data.providers.orEmpty()
                 _uiState.update { it.copy(modelPickerPinned = AuthManager.getPinnedModels()) }
+                syncCurrentModelCapabilities()
             }
         }
     }
@@ -2182,6 +2295,7 @@ class ChatViewModel(
                             modelPickerLoading = false,
                         )
                     }
+                    syncCurrentModelCapabilities()
                 }
 
                 is NetworkResult.Failure -> {
@@ -2236,6 +2350,7 @@ class ChatViewModel(
                 currentSessionModel = "$provider/$model",
             )
         }
+        syncCurrentModelCapabilities()
         // Model switch changes the context-window denominator — refetch it.
         fetchContextUsage()
         handleSlashCommand("/model $model --provider $provider --session")
@@ -2264,6 +2379,40 @@ class ChatViewModel(
                 ),
                 onSent = { id -> trackRequest(id, WsMethods.CONFIG_SET) },
             )
+        }
+    }
+
+    fun getModelCapabilities(
+        providerSlug: String,
+        modelName: String,
+    ): ModelCapabilities? = cachedModelOptions.find { it.slug == providerSlug }?.capabilities?.get(modelName)
+
+    fun getCurrentModelCapabilities(): ModelCapabilities? {
+        val label = _uiState.value.currentSessionModel ?: return null
+        val idx = label.indexOf('/')
+        if (idx <= 0) return null
+        val provider = label.substring(0, idx)
+        val model = label.substring(idx + 1)
+        return getModelCapabilities(provider, model)
+    }
+
+    private fun syncCurrentModelCapabilities() {
+        val label = _uiState.value.currentSessionModel
+        val caps =
+            if (label == null) {
+                null
+            } else {
+                val idx = label.indexOf('/')
+                if (idx <= 0) {
+                    null
+                } else {
+                    val provider = label.substring(0, idx)
+                    val model = label.substring(idx + 1)
+                    cachedModelOptions.find { it.slug == provider }?.capabilities?.get(model)
+                }
+            }
+        _uiState.update { state ->
+            if (state.currentModelCapabilities != caps) state.copy(currentModelCapabilities = caps) else state
         }
     }
 
@@ -2306,7 +2455,11 @@ class ChatViewModel(
                     state.messages.isEmpty() &&
                     cachedMessages.isNotEmpty()
                 ) {
-                    state.copy(messages = cachedMessages, isLoading = false)
+                    state.copy(
+                        messages = cachedMessages,
+                        isLoading = false,
+                        todos = hydrateTodosFromMessages(cachedMessages),
+                    )
                 } else {
                     state
                 }
@@ -2350,7 +2503,14 @@ class ChatViewModel(
                     // REST 200 — the gateway has the row for this session.
                     sessionHasServerPresence = true
                     val serverOffset = result.data.pagination?.offset ?: result.data.offset ?: requestedOffset
-                    val chatMessages = mapServerMessages(sessionId, result.data.messages.orEmpty(), serverOffset)
+                    val chatMessages =
+                        mapServerMessages(
+                            sessionId,
+                            result.data.messages.orEmpty(),
+                            serverOffset,
+                            latestPaging,
+                            _uiState.value.messages,
+                        )
                     loadedMessageOffset = serverOffset
                     withContext(ioDispatcher) {
                         repo.persistMessages(chatMessages, sessionId)
@@ -2374,6 +2534,7 @@ class ChatViewModel(
                             }
                         state.copy(
                             messages = merged,
+                            todos = hydrateTodosFromMessages(merged),
                             isLoading = false,
                             hasOlderMessages = hasOlder,
                             isLoadingOlder = false,
@@ -2466,6 +2627,7 @@ class ChatViewModel(
                 showModelPicker = false,
                 modelPickerLoading = false,
                 currentSessionModel = null,
+                currentModelCapabilities = null,
                 reasoningLevel = null,
                 terminalBackend = null,
                 usedContextTokens = null,
@@ -2705,7 +2867,14 @@ class ChatViewModel(
                 is NetworkResult.Success -> {
                     if (!isCurrentSessionRequest(sessionId, generation)) return@launch
                     val returnedOffset = result.data.pagination?.offset ?: result.data.offset ?: newOffset
-                    val older = mapServerMessages(sessionId, result.data.messages.orEmpty(), returnedOffset)
+                    val older =
+                        mapServerMessages(
+                            sessionId,
+                            result.data.messages.orEmpty(),
+                            returnedOffset,
+                            latestPaging,
+                            _uiState.value.messages,
+                        )
                     loadedMessageOffset = returnedOffset
                     withContext(ioDispatcher) { repo.persistMessages(older, sessionId) }
                     _uiState.update { current ->
@@ -2782,7 +2951,14 @@ class ChatViewModel(
                 when (result) {
                     is NetworkResult.Success -> {
                         if (!isCurrentSessionRequest(sessionId, generation)) return@launch
-                        val incoming = mapServerMessages(sessionId, result.data.messages.orEmpty(), nextOffset)
+                        val incoming =
+                            mapServerMessages(
+                                sessionId,
+                                result.data.messages.orEmpty(),
+                                nextOffset,
+                                latestPaging,
+                                _uiState.value.messages,
+                            )
                         if (incoming.isEmpty()) return@launch
                         withContext(ioDispatcher) { repo.persistMessages(incoming, sessionId) }
                         _uiState.update { current ->
@@ -3068,449 +3244,6 @@ class ChatViewModel(
         }
     }
 
-    private fun mapServerMessages(
-        sessionId: String,
-        messages: List<SessionMessage>,
-        offset: Int,
-    ): List<ChatMessage> {
-        val existingReasoningMap =
-            _uiState.value.messages
-                .filter { it.reasoningText.isNotBlank() }
-                .associateBy { it.content }
-
-        // Tool rows in the REST transcript carry NO tool name — the live WS
-        // stream was the only source of `toolName`. Match each REST tool row
-        // to its WS counterpart by RESULT CONTENT (not position — pagination
-        // and mixed cache state make positional mapping misalign, leaving
-        // the newest call with a null name → generic "tool" bubble). When a
-        // match is found the live message is reused wholesale (same id +
-        // toolName + rich payload), so persistence upserts the same row
-        // instead of accumulating a second `rest-` copy in Room. Issue #771.
-        val liveToolByResult = linkedMapOf<String, ChatMessage>()
-        _uiState.value.messages
-            .filter { it.role == MessageRole.TOOL }
-            .sortedBy { it.id.startsWith("rest-") } // prefer live WS copies
-            .forEach { msg ->
-                canonicalToolResultKey(msg.content)?.let { key ->
-                    liveToolByResult.putIfAbsent(key, msg)
-                }
-            }
-
-        // Issue #842: REST transcript rows carry the gateway's `tool_call_id`
-        // — prefer matching live bubbles by that 1:1 identity. It works for
-        // EVERY tool shape, including MCP/web rows whose REST copy is raw
-        // `<untrusted_tool_result>` text with no JSON key to canonicalize.
-        val liveToolByCallId = linkedMapOf<String, ChatMessage>()
-        _uiState.value.messages
-            .filter { it.role == MessageRole.TOOL && it.toolCallId.isNotBlank() }
-            .sortedBy { it.id.startsWith("rest-") } // prefer live WS copies
-            .forEach { msg ->
-                liveToolByCallId.putIfAbsent(msg.toolCallId, msg)
-            }
-
-        val mapped = mutableListOf<ChatMessage>()
-        // The gateway stores a reasoning-model's thinking as its OWN assistant
-        // row (content = "", reasoning = trace) directly before the answer row.
-        // Rendering that as a standalone empty assistant bubble is the
-        // "reasoning box in a separate bubble" artifact — fold it into the
-        // next assistant message with content instead. Issue #771.
-        var pendingReasoning: String? = null
-
-        messages.forEachIndexed { index, msg ->
-            val role =
-                when (msg.role?.lowercase()) {
-                    "user" -> MessageRole.USER
-                    "system" -> MessageRole.SYSTEM
-                    "tool" -> MessageRole.TOOL
-                    else -> MessageRole.ASSISTANT
-                }
-            val globalIndex = offset + index
-            // Issue #859: under newest-anchored paging use the server's
-            // AUTOINCREMENT row id as the stable key — from-end positions shift
-            // as the transcript grows and would collide across hydrations
-            // (distinctBy would silently drop the newest copy). Legacy paging
-            // keeps the absolute-position key its count-based sync math needs.
-            val restId =
-                if (latestPaging) {
-                    msg.id?.let { "rest-$sessionId-$it" } ?: "rest-$sessionId-$globalIndex"
-                } else {
-                    "rest-$sessionId-$globalIndex"
-                }
-            val timestamp =
-                msg.timestampText
-                    ?.toDoubleOrNull()
-                    ?.times(1000)
-                    ?.toLong()
-                    ?: System.currentTimeMillis()
-
-            val rawContent = msg.contentText
-            val rowReasoning =
-                if (msg.reasoningText.isNotBlank()) {
-                    msg.reasoningText
-                } else {
-                    existingReasoningMap[rawContent]?.reasoningText.orEmpty()
-                }
-
-            // Reasoning-only assistant row (the gateway's split storage of a
-            // reasoning turn): stash the trace, skip the empty bubble, and
-            // attach it to the next assistant message that has content.
-            if (role == MessageRole.ASSISTANT && rawContent.isBlank() && rowReasoning.isNotBlank()) {
-                pendingReasoning = rowReasoning
-                return@forEachIndexed
-            }
-
-            var finalContent = rawContent
-            var attachments: List<Attachment>? = null
-            if (role == MessageRole.ASSISTANT && rawContent.contains("MEDIA:")) {
-                val items = HostMediaExtractor.extract(rawContent)
-                if (items.isNotEmpty()) {
-                    val baseUrl = AuthManager.getBaseUrl()
-                    val token = AuthManager.getToken().orEmpty()
-                    finalContent = HostMediaExtractor.strip(rawContent)
-                    attachments =
-                        items
-                            .mapNotNull { item ->
-                                val url =
-                                    GatewayFileClient.buildMediaUrl(
-                                        baseUrl,
-                                        token,
-                                        item.path,
-                                    ) ?: return@mapNotNull null
-                                Attachment(
-                                    uri = url,
-                                    name = mediaNameFromPath(item.path),
-                                    mimeType = mediaMimeForPath(item.path),
-                                    size = 0,
-                                    gatewayUrl = url,
-                                    source = AttachmentSource.GATEWAY,
-                                )
-                            }.takeIf { it.isNotEmpty() }
-                }
-            }
-
-            val finalReasoning =
-                if (rowReasoning.isNotBlank()) {
-                    rowReasoning
-                } else if (role == MessageRole.ASSISTANT && pendingReasoning != null) {
-                    pendingReasoning.also { pendingReasoning = null }
-                } else {
-                    ""
-                }
-
-            // Tool rows in the REST transcript carry no tool name. When the
-            // result payload matches a live WS tool message, reuse it whole —
-            // keeps the real name, the rich WS payload, AND the same id so
-            // Room upserts instead of accumulating a duplicate `rest-` row.
-            if (role == MessageRole.TOOL) {
-                // Prefer the gateway call id (1:1, works for every tool
-                // shape), then fall back to result-content matching.
-                liveToolByCallId[msg.toolCallId]?.let { live ->
-                    mapped.add(live)
-                    return@forEachIndexed
-                }
-                canonicalToolResultKey(rawContent)?.let { key ->
-                    liveToolByResult[key]?.let { live ->
-                        mapped.add(live)
-                        return@forEachIndexed
-                    }
-                }
-            }
-
-            mapped.add(
-                ChatMessage(
-                    id = restId,
-                    role = role,
-                    content = finalContent,
-                    reasoningText = finalReasoning,
-                    toolCallId = msg.toolCallId,
-                    attachments = attachments,
-                    timestamp = timestamp,
-                    isStreaming = false,
-                    displayKind = msg.display_kind,
-                ),
-            )
-        }
-
-        // A reasoning-only row with no following answer (interrupted turn):
-        // don't drop the trace — attach it to the last assistant message.
-        if (pendingReasoning != null) {
-            val lastAssistantIdx = mapped.indexOfLast { it.role == MessageRole.ASSISTANT }
-            if (lastAssistantIdx >= 0) {
-                val target = mapped[lastAssistantIdx]
-                if (target.reasoningText.isBlank()) {
-                    mapped[lastAssistantIdx] = target.copy(reasoningText = pendingReasoning)
-                }
-            }
-        }
-
-        return mapped
-    }
-
-    // ── Issue #724: attach host-path MEDIA: files as real attachments ────
-    //
-    // The gateway's WebSocket stream delivers the raw `MEDIA:<path>` directive
-    // the desktop app turns into an authenticated `/api/files/download?...`
-    // URL. We parse every directive, build the download URL via
-    // [GatewayFileClient], classify it (image / audio / video / file) using
-    // [mediaKindForPath], and attach it to the message. Images render inline
-    // (Coil loads the URL); every other type becomes a tappable, fetchable
-    // attachment. The directive text is stripped from the message body. Works
-    // on a remote phone (real HTTP). Mobile-only; backend untouched. Pure
-    // parsing lives in [HostMediaExtractor].
-
-    /**
-     * ViewModel-side handler for [ReducerEffect.AttachHostMedia]: find the local
-     * message by id, convert any `MEDIA:<path>` directives into [Attachment]s
-     * (via the gateway download URL) and strip them from the text. Role,
-     * reasoning, timestamp and existing attachments are preserved; new gateway
-     * attachments are appended. Idempotent — skips if gateway attachments for
-     * the same paths already exist.
-     */
-    private fun attachHostMedia(
-        sessionId: String,
-        messageId: String,
-    ) {
-        val current = _uiState.value.messages.find { it.id == messageId } ?: return
-        val content = current.content
-        val items = HostMediaExtractor.extract(content)
-        if (items.isEmpty()) return
-
-        val baseUrl = AuthManager.getBaseUrl()
-        if (baseUrl.isBlank()) return
-        // NOTE: no token gate here. Gated (basic-auth) dashboards download via
-        // the session cookie, and even loopback hosts can serve files with an
-        // empty query token — requiring a non-blank token dropped every MEDIA
-        // attachment on gate-auth connections where getToken() returns null.
-
-        val existingUrls =
-            current.attachments
-                .orEmpty()
-                .mapNotNull { it.gatewayUrl }
-                .toSet()
-        val newAttachments =
-            items.mapNotNull { item ->
-                val token = AuthManager.getToken().orEmpty()
-                val url = GatewayFileClient.buildMediaUrl(baseUrl, token, item.path) ?: return@mapNotNull null
-                if (url in existingUrls) return@mapNotNull null
-                Attachment(
-                    uri = url,
-                    name = mediaNameFromPath(item.path),
-                    mimeType = mediaMimeForPath(item.path),
-                    size = 0,
-                    gatewayUrl = url,
-                    source = AttachmentSource.GATEWAY,
-                )
-            }
-        if (newAttachments.isEmpty()) return
-
-        val stripped = HostMediaExtractor.strip(content)
-        _uiState.update { state ->
-            state.copy(
-                messages =
-                    state.messages.map { msg ->
-                        if (msg.id == messageId) {
-                            msg.copy(
-                                content = stripped,
-                                attachments =
-                                    (msg.attachments.orEmpty() + newAttachments)
-                                        .distinctBy { it.gatewayUrl ?: it.uri },
-                            )
-                        } else {
-                            msg
-                        }
-                    },
-            )
-        }
-    }
-
-    /**
-     * Open an attachment when its chip/thumbnail is tapped.
-     *
-     * - LOCAL (user-picked) files: open the original `content://` URI
-     *   directly via [android.content.Intent.ACTION_VIEW] — the resolver
-     *   already grants read access for the picked document. If that fails
-     *   (e.g. the permission lapsed), we copy to cache and retry via
-     *   FileProvider so the tap is never a silent no-op.
-     * - GATEWAY (agent `MEDIA:`) files: stream the file to cache via
-     *   [GatewayFileClient] (chunked — never held in memory), then open with
-     *   [android.content.Intent.ACTION_VIEW] through FileProvider — so a
-     *   remote phone can view agent-delivered files in-place.
-     *
-     * Failures surface through [ChatUiState.openError] (non-blocking
-     * snackbar); the tap is never swallowed.
-     */
-    fun openAttachment(attachment: Attachment) {
-        val ctx = getApplication<Application>().applicationContext
-        if (attachment.source == AttachmentSource.LOCAL) {
-            // Best-effort direct open of the picked content URI.
-            runCatching { openWithView(ctx, android.net.Uri.parse(attachment.uri), attachment.mimeType) }
-                .onSuccess { return }
-                .onFailure { /* fall through to cache-copy below */ }
-        }
-        // GATEWAY, or LOCAL direct-open failed → fetch/copy then open.
-        val path = gatewayPathFor(attachment)
-        // Show a loading indicator on the attachment card while the file
-        // streams down (mirrors the save spinner; cleared in all outcomes).
-        _uiState.update { it.copy(openingAttachmentPath = path) }
-        val cacheDir = java.io.File(ctx.cacheDir, "gateway_files")
-        viewModelScope.launch(ioDispatcher) {
-            try {
-                when (val result = GatewayFileClient.fetch(path, cacheDir)) {
-                    is GatewayFileResult.Success -> {
-                        openBytes(ctx, result.file)
-                    }
-
-                    is GatewayFileResult.NotFound -> {
-                        showOpenError("File not found on gateway: ${attachment.name}")
-                    }
-
-                    is GatewayFileResult.Forbidden -> {
-                        showOpenError("Access denied: ${attachment.name}")
-                    }
-
-                    is GatewayFileResult.TooLarge -> {
-                        showOpenError("File too large to open: ${attachment.name}")
-                    }
-
-                    is GatewayFileResult.Unauthorized -> {
-                        showOpenError("Session expired — reconnect to open: ${attachment.name}")
-                    }
-
-                    is GatewayFileResult.Failure -> {
-                        showOpenError("Could not open ${attachment.name}: ${result.throwable.message}")
-                    }
-                }
-            } finally {
-                _uiState.update {
-                    if (it.openingAttachmentPath == path) it.copy(openingAttachmentPath = null) else it
-                }
-            }
-        }
-    }
-
-    /** Save an agent-delivered file through Android's system document picker. */
-    fun saveAttachment(
-        attachment: Attachment,
-        destination: android.net.Uri,
-    ) {
-        if (_uiState.value.savingAttachmentPath != null) return
-        val path = gatewayPathFor(attachment)
-        val cacheDir =
-            java.io.File(getApplication<Application>().applicationContext.cacheDir, "gateway_files")
-        _uiState.update { it.copy(savingAttachmentPath = path) }
-        viewModelScope.launch(ioDispatcher) {
-            try {
-                when (val result = GatewayFileClient.fetch(path, cacheDir)) {
-                    is GatewayFileResult.Success -> {
-                        val resolver = getApplication<Application>().contentResolver
-                        runCatching {
-                            resolver
-                                .openOutputStream(destination, "wt")
-                                ?.use { output ->
-                                    result.file.cacheFile.inputStream().use { input ->
-                                        GatewayFileClient.copyChunked(input, output)
-                                    }
-                                }
-                                ?: error("destination is unavailable")
-                        }.onSuccess {
-                            showOpenError("Saved ${result.file.name}")
-                        }.onFailure {
-                            showOpenError("Could not save ${attachment.name}: ${it.message}")
-                        }
-                    }
-
-                    is GatewayFileResult.NotFound -> showOpenError("File not found on gateway: ${attachment.name}")
-                    is GatewayFileResult.Forbidden -> showOpenError("Access denied: ${attachment.name}")
-                    is GatewayFileResult.TooLarge -> showOpenError("File too large to save: ${attachment.name}")
-                    is GatewayFileResult.Unauthorized ->
-                        showOpenError(
-                            "Session expired — reconnect to save: ${attachment.name}",
-                        )
-                    is GatewayFileResult.Failure ->
-                        showOpenError("Could not save ${attachment.name}: ${result.throwable.message}")
-                }
-            } finally {
-                _uiState.update {
-                    if (it.savingAttachmentPath == path) {
-                        it.copy(savingAttachmentPath = null)
-                    } else {
-                        it
-                    }
-                }
-            }
-        }
-    }
-
-    fun gatewayPathFor(attachment: Attachment): String =
-        attachment.gatewayUrl?.let(::gatewayPathFromUrl)
-            ?: attachment.uri.removePrefix("gateway:").takeIf { it != attachment.uri }
-            ?: attachment.name
-
-    /** Open a gateway file already streamed to cache via FileProvider + ACTION_VIEW. */
-    private fun openBytes(
-        ctx: android.content.Context,
-        file: GatewayFile,
-    ) {
-        runCatching {
-            val uri =
-                androidx.core.content.FileProvider.getUriForFile(
-                    ctx,
-                    "${ctx.packageName}.fileprovider",
-                    file.cacheFile,
-                )
-            openWithView(ctx, uri, file.mimeType)
-        }.onFailure { showOpenError("Could not open ${file.name}: ${it.message}") }
-    }
-
-    /** Fire an ACTION_VIEW intent; throws if no activity can handle the type. */
-    private fun openWithView(
-        ctx: android.content.Context,
-        uri: android.net.Uri,
-        mimeType: String,
-    ) {
-        val viewIntent =
-            android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, mimeType.ifBlank { "*/*" })
-                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-        try {
-            ctx.startActivity(viewIntent)
-        } catch (e: Throwable) {
-            val fallbackIntent =
-                android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, "*/*")
-                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-            val chooser =
-                android.content.Intent.createChooser(fallbackIntent, "Open file").apply {
-                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-            ctx.startActivity(chooser)
-        }
-    }
-
-    private fun showOpenError(message: String) {
-        _uiState.update { it.copy(openError = message) }
-    }
-
-    fun clearOpenError() {
-        _uiState.update { it.copy(openError = null) }
-    }
-
-    private fun sameMessages(
-        left: List<ChatMessage>,
-        right: List<ChatMessage>,
-    ): Boolean =
-        left.size == right.size &&
-            left.zip(right).all { (a, b) ->
-                a.id == b.id &&
-                    a.role == b.role &&
-                    a.content == b.content &&
-                    a.reasoningText == b.reasoningText
-            }
-
     // ── UI actions ───────────────────────────────────────────────────────
 
     /**
@@ -3614,7 +3347,7 @@ class ChatViewModel(
 
     private fun handleApprovalRequest(event: WsEvent.ApprovalRequest) {
         val description = event.description ?: event.command ?: "Unknown command"
-        val content = "⚠️ **Approval Required**\n$description"
+        val content = "**Approval Required**\n$description"
         val msg =
             ChatMessage(
                 role = MessageRole.SYSTEM,

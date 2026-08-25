@@ -17,8 +17,8 @@ internal class LocalSpeechPipeline(
     private data class Frame(val bytes: ByteArray = ByteArray(FRAME_BYTES), var size: Int = 0)
 
     private val lock = Any()
-    private val available = ArrayDeque<Frame>(CAPACITY)
-    private val pending = ArrayDeque<Frame>(CAPACITY)
+    private val available = ArrayDeque<Frame>(FRAME_CAPACITY)
+    private val pending = ArrayDeque<Frame>(FRAME_CAPACITY)
     private val active = AtomicBoolean(true)
     private val vadWindow = ByteArray(VAD_WINDOW_BYTES)
     private val carry = ByteArray(FRAME_BYTES)
@@ -32,7 +32,7 @@ internal class LocalSpeechPipeline(
     private var closed = false
 
     init {
-        repeat(CAPACITY) { available.addLast(Frame()) }
+        repeat(FRAME_CAPACITY) { available.addLast(Frame()) }
     }
 
     /** Returns immediately; a full queue becomes one terminal failure, never silent audio loss. */
@@ -193,10 +193,10 @@ internal class LocalSpeechPipeline(
 
     internal class OverflowException : IllegalStateException("Speech pipeline queue is full")
 
-    private companion object {
-        const val CAPACITY = 25
-        const val FRAME_BYTES = 640
-        const val VAD_WINDOW_BYTES = 1_024
-        const val VAD_WINDOW_MILLIS = 32
+    companion object {
+        internal const val FRAME_CAPACITY = 100
+        internal const val FRAME_BYTES = 640
+        private const val VAD_WINDOW_BYTES = 1_024
+        private const val VAD_WINDOW_MILLIS = 32
     }
 }

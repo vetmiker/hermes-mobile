@@ -23,6 +23,7 @@ import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
 import com.m57.hermescontrol.glasses.GlassesModeControllerProvider
 import com.m57.hermescontrol.glasses.GlassesModeState
+import com.m57.hermescontrol.glasses.VoiceTranscriptUiEvent
 import com.m57.hermescontrol.glasses.service.MyvuGlassesService
 import com.m57.hermescontrol.ui.chat.fakes.FakeChatPersistenceRepository
 import com.m57.hermescontrol.ui.chat.fakes.FakeSlashUsageStore
@@ -72,6 +73,7 @@ class ChatViewModelTest {
     private lateinit var app: Application
     private lateinit var fakeRepo: FakeChatPersistenceRepository
     private lateinit var fakeSlashUsageStore: FakeSlashUsageStore
+    private val voiceTranscriptEvents = MutableSharedFlow<VoiceTranscriptUiEvent>(extraBufferCapacity = 8)
 
     /** Counter used to generate unique WS request IDs. */
     private var reqCount = 0
@@ -218,10 +220,22 @@ class ChatViewModelTest {
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     /** Create a ViewModel with the fake repo injected directly. */
-    private fun createViewModel(startCleanup: Boolean = false): ChatViewModel =
+    private fun createViewModel(
+        startCleanup: Boolean = false,
+        terminalLeaseReleaser: suspend (String, String) -> Unit = { _, _ -> },
+    ): ChatViewModel =
         // Both dispatchers injected — a real ioDispatcher would race the
         // test scheduler (repo writes hop it) and shuffle RPC ordering.
-        ChatViewModel(app, startCleanup, fakeRepo, fakeSlashUsageStore, testDispatcher, testDispatcher)
+        ChatViewModel(
+            app,
+            startCleanup,
+            fakeRepo,
+            fakeSlashUsageStore,
+            testDispatcher,
+            testDispatcher,
+            voiceTranscriptEvents,
+            terminalLeaseReleaser,
+        )
 
     /**
      * Create ViewModel, simulate GatewayReady, feed SESSION_CREATE result,
@@ -232,8 +246,9 @@ class ChatViewModelTest {
      */
     private suspend fun TestScope.createViewModelWithSession(
         startCleanup: Boolean = false,
+        terminalLeaseReleaser: suspend (String, String) -> Unit = { _, _ -> },
     ): Pair<ChatViewModel, String> {
-        val viewModel = createViewModel(startCleanup)
+        val viewModel = createViewModel(startCleanup, terminalLeaseReleaser)
         advanceUntilIdle()
 
         mockConnectionStatus.value = ConnectionStatus.CONNECTED
@@ -270,6 +285,82 @@ class ChatViewModelTest {
             ),
         )
     }
+
+    @Test
+    fun acceptedVoiceTranscriptAppearsOnceAndFailureRemovesOnlyItsOptimisticRow() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+
+            voiceTranscriptEvents.emit(
+                VoiceTranscriptUiEvent.Published(
+                    storedSessionId = sessionId,
+                    runtimeSessionId = sessionId,
+                    utteranceId = "utterance-1",
+                    text = "check the weather",
+                ),
+            )
+            voiceTranscriptEvents.emit(
+                VoiceTranscriptUiEvent.Published(
+                    storedSessionId = sessionId,
+                    runtimeSessionId = sessionId,
+                    utteranceId = "utterance-2",
+                    text = "check the weather",
+                ),
+            )
+            voiceTranscriptEvents.emit(
+                VoiceTranscriptUiEvent.Published(
+                    storedSessionId = sessionId,
+                    runtimeSessionId = sessionId,
+                    utteranceId = "utterance-1",
+                    text = "check the weather",
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf("utterance-1", "utterance-2"),
+                viewModel.uiState.value.messages.filter { it.role == MessageRole.USER }.map { it.id },
+            )
+            voiceTranscriptEvents.emit(
+                VoiceTranscriptUiEvent.SubmissionFailed(
+                    storedSessionId = sessionId,
+                    runtimeSessionId = sessionId,
+                    utteranceId = "utterance-1",
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(
+                listOf("utterance-2"),
+                viewModel.uiState.value.messages.filter { it.role == MessageRole.USER }.map { it.id },
+            )
+        }
+
+    @Test
+    fun voiceTranscriptForAnotherStoredOrRuntimeSessionIsIgnored() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+
+            voiceTranscriptEvents.emit(
+                VoiceTranscriptUiEvent.Published(
+                    storedSessionId = "other-stored-session",
+                    runtimeSessionId = sessionId,
+                    utteranceId = "utterance-0",
+                    text = "must not display",
+                ),
+            )
+            voiceTranscriptEvents.emit(
+                VoiceTranscriptUiEvent.Published(
+                    storedSessionId = sessionId,
+                    runtimeSessionId = "other-runtime-session",
+                    utteranceId = "utterance-1",
+                    text = "must not display",
+                ),
+            )
+            advanceUntilIdle()
+
+            assertTrue(viewModel.uiState.value.messages.none { it.role == MessageRole.USER })
+        }
 
     @Test
     fun slashDispatch_aliasToLocalCommand_recoversGlassesPhonePriority() =
@@ -3808,6 +3899,69 @@ class ChatViewModelTest {
                 vm.uiState.value.openError!!
                     .contains("missing.pdf"),
             )
+        }
+
+    @Test
+    fun messageCompleteForMatchingGlassesVoiceTurnDefersTerminalRelease() =
+        runTest {
+            val released = mutableListOf<Pair<String, String>>()
+            val (_, sessionId) =
+                createViewModelWithSession(
+                    terminalLeaseReleaser = { runtimeSessionId, text ->
+                        released += runtimeSessionId to text
+                    },
+                )
+            activateGlassesForSession(sessionId, sessionId)
+            val controller = GlassesModeControllerProvider.controller
+            assertTrue(
+                controller.acceptTranscript(
+                    controller.snapshot.value.generation,
+                    checkNotNull(controller.snapshot.value.activeStreamId),
+                    "utterance",
+                    "voice",
+                ).accepted,
+            )
+
+            mockEventsFlow.emit(WsEvent.MessageComplete("Final response", sessionId))
+            advanceUntilIdle()
+
+            assertTrue(released.isEmpty())
+        }
+
+    @Test
+    fun messageCompleteForMatchingPhonePriorityTurnDefersTerminalRelease() =
+        runTest {
+            val released = mutableListOf<Pair<String, String>>()
+            val (_, sessionId) =
+                createViewModelWithSession(
+                    terminalLeaseReleaser = { runtimeSessionId, text ->
+                        released += runtimeSessionId to text
+                    },
+                )
+            activateGlassesForSession(sessionId, sessionId)
+            assertTrue(GlassesModeControllerProvider.controller.claimPhonePriority(sessionId, sessionId))
+
+            mockEventsFlow.emit(WsEvent.MessageComplete("Final response", sessionId))
+            advanceUntilIdle()
+
+            assertTrue(released.isEmpty())
+        }
+
+    @Test
+    fun messageCompleteOutsideGlassesReleasesTerminalLease() =
+        runTest {
+            val released = mutableListOf<Pair<String, String>>()
+            val (_, sessionId) =
+                createViewModelWithSession(
+                    terminalLeaseReleaser = { runtimeSessionId, text ->
+                        released += runtimeSessionId to text
+                    },
+                )
+
+            mockEventsFlow.emit(WsEvent.MessageComplete("Final response", sessionId))
+            advanceUntilIdle()
+
+            assertEquals(listOf(sessionId to "Final response"), released)
         }
 
     @Test

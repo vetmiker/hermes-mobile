@@ -1,11 +1,19 @@
 package com.m57.hermescontrol.ui.chat
 
+import com.m57.hermescontrol.glasses.GlassesInitialDisplayKind
 import com.m57.hermescontrol.ui.chat.fullbleed.AgentEntry
 import com.m57.hermescontrol.ui.chat.fullbleed.ChatTurn
 import com.m57.hermescontrol.ui.chat.fullbleed.groupIntoTurns
 
+private const val EMPTY_SESSION_DISPLAY = "Hermes is ready."
+
+internal data class GlassesInitialDisplay(
+    val text: String,
+    val kind: GlassesInitialDisplayKind,
+)
+
 /**
- * Produces the immutable context shown when a chat is handed to the glasses.
+ * Produces the immutable classified content shown when a chat is handed to the glasses.
  *
  * The full-bleed renderer is the canonical authority for which rows are user
  * turns, assistant prose, tool rows, and synthetic/system events. Reusing its
@@ -16,10 +24,17 @@ internal fun initialGlassesDisplay(
     messages: List<ChatMessage>,
     isAgentTyping: Boolean = false,
     streamingMessage: ChatMessage? = null,
-): String? {
+): GlassesInitialDisplay? {
     if (isAgentTyping || streamingMessage != null) return null
-
     val turns = groupIntoTurns(messages)
+    if (
+        turns.all { turn ->
+            turn is ChatTurn.Agent && turn.entries.all { it is AgentEntry.SystemEvent }
+        }
+    ) {
+        return GlassesInitialDisplay(EMPTY_SESSION_DISPLAY, GlassesInitialDisplayKind.NEUTRAL)
+    }
+
     val userTurnIndex = turns.indexOfLast { it is ChatTurn.User }
     val userTurn = turns.getOrNull(userTurnIndex) as? ChatTurn.User ?: return null
     val agentTurn = turns.getOrNull(userTurnIndex + 1) as? ChatTurn.Agent ?: return null
@@ -35,7 +50,10 @@ internal fun initialGlassesDisplay(
             .joinToString(separator = "\n\n")
     if (response.isBlank()) return null
 
-    return "You:\n$prompt\n\nHermes:\n$response"
+    return GlassesInitialDisplay(
+        text = "You:\n$prompt\n\nHermes:\n$response",
+        kind = GlassesInitialDisplayKind.COMPLETED_RESPONSE,
+    )
 }
 
 private fun isIncompleteAgentEntry(entry: AgentEntry): Boolean =

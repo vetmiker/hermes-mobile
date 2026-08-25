@@ -47,68 +47,149 @@ val List<MyvuDisplayCommand>.fontCommand: MyvuDisplayCommand?
 class MyvuDisplayRenderer(
     private val documentId: () -> String = { UUID.randomUUID().toString() },
 ) {
-    private var activeDocumentKey: String? = null
+    private data class DocumentIdentity(
+        val fileKey: String,
+        val msgId: String,
+        val pacingMillis: Int,
+    )
 
+    private var activeDocument: DocumentIdentity? = null
+    private var activeInputDocument: DocumentIdentity? = null
+    private var activeInputText: String? = null
+    private var thinkingDocument: DocumentIdentity? = null
+    private var responseDocument: DocumentIdentity? = null
+
+    @Synchronized
     fun commandsFor(
         text: String,
         kind: DisplayKind,
         readability: GlassesReadability = GlassesReadability(),
     ): List<MyvuDisplayCommand> {
         require(text.isNotEmpty()) { "Display text cannot be empty" }
-        val documentKey =
-            if (kind == DisplayKind.Response || activeDocumentKey == null) {
-                "${documentId()}/hermes-agent".also { activeDocumentKey = it }
-            } else {
-                checkNotNull(activeDocumentKey)
-            }
-        val openPayload = openApp(text, documentKey, readability.pacingMillis)
-        val contentPayload = sendContent(text, documentKey)
-        val fontPayload =
-            buildJsonObject {
-                put("action", "system")
-                put(
-                    "data",
-                    buildJsonObject {
-                        put("action", "set_font_mode")
-                        put("value", readability.fontMode.vendorValue)
-                    },
-                )
-            }.toString()
+        if (kind == DisplayKind.Response) return openResponse(text, readability)
+
+        val document = activeDocument ?: newDocument(readability).also { activeDocument = it }
+        if (kind == DisplayKind.Input) {
+            activeInputDocument = document
+            activeInputText = text
+        }
+        return openDocument(text, document, readability)
+    }
+
+    /**
+     * Extends the active input document with the turn marker when one exists.
+     *
+     * A response begins on its own document, so preserving the input here keeps
+     * the prompt visible during tool work without contaminating response scroll.
+     */
+    @Synchronized
+    fun openThinking(
+        text: String,
+        readability: GlassesReadability,
+    ): List<MyvuDisplayCommand> {
+        val document = activeInputDocument ?: newDocument(readability)
+        thinkingDocument = document
+        activeDocument = document
+        return openDocument(thinkingText(text), document, readability)
+    }
+
+    @Synchronized
+    fun updateThinking(text: String): List<MyvuDisplayCommand> =
+        updateDocument(
+            text = thinkingText(text),
+            document = checkNotNull(thinkingDocument) { "A thinking document must be opened first" },
+        )
+
+    @Synchronized
+    fun openResponse(
+        text: String,
+        readability: GlassesReadability = GlassesReadability(),
+    ): List<MyvuDisplayCommand> {
+        val document = newDocument(readability)
+        activeInputDocument = null
+        activeInputText = null
+        thinkingDocument = null
+        responseDocument = document
+        activeDocument = document
+        return openDocument(text, document, readability)
+    }
+
+    /**
+     * Replays MYVU's required open-content pair for the same response identity.
+     */
+    @Synchronized
+    fun updateResponse(text: String): List<MyvuDisplayCommand> =
+        updateDocument(
+            text = text,
+            document = checkNotNull(responseDocument) { "A response document must be opened first" },
+        )
+
+    private fun thinkingText(text: String): String = activeInputText?.let { "$it\n\n$text" } ?: text
+
+    private fun newDocument(readability: GlassesReadability): DocumentIdentity =
+        DocumentIdentity(
+            fileKey = "${documentId()}/hermes-agent",
+            msgId = UUID.randomUUID().toString(),
+            pacingMillis = readability.pacingMillis,
+        )
+
+    private fun openDocument(
+        text: String,
+        document: DocumentIdentity,
+        readability: GlassesReadability,
+    ): List<MyvuDisplayCommand> =
+        updateDocument(text, document) +
+            MyvuDisplayCommand(
+                receiverPackage = MyvuProtocol.LAUNCHER_RECEIVER,
+                senderPackage = PERSONAL_PACKAGE,
+                payload = fontMode(readability),
+                documentKey = document.fileKey,
+                fontMode = readability.fontMode,
+            )
+
+    private fun updateDocument(
+        text: String,
+        document: DocumentIdentity,
+    ): List<MyvuDisplayCommand> {
+        require(text.isNotEmpty()) { "Display text cannot be empty" }
         return listOf(
             MyvuDisplayCommand(
                 receiverPackage = MyvuProtocol.LAUNCHER_RECEIVER,
                 senderPackage = PERSONAL_PACKAGE,
-                payload = openPayload,
-                documentKey = documentKey,
+                payload = openApp(text, document),
+                documentKey = document.fileKey,
             ),
             MyvuDisplayCommand(
                 receiverPackage = MyvuProtocol.LAUNCHER_RECEIVER,
                 senderPackage = PERSONAL_PACKAGE,
-                payload = contentPayload,
-                documentKey = documentKey,
-            ),
-            MyvuDisplayCommand(
-                receiverPackage = MyvuProtocol.LAUNCHER_RECEIVER,
-                senderPackage = PERSONAL_PACKAGE,
-                payload = fontPayload,
-                documentKey = documentKey,
-                fontMode = readability.fontMode,
+                payload = sendContent(text, document),
+                documentKey = document.fileKey,
             ),
         )
     }
 
+    private fun fontMode(readability: GlassesReadability): String =
+        buildJsonObject {
+            put("action", "system")
+            put(
+                "data",
+                buildJsonObject {
+                    put("action", "set_font_mode")
+                    put("value", readability.fontMode.vendorValue)
+                },
+            )
+        }.toString()
+
     private fun openApp(
         text: String,
-        documentKey: String,
-        pacingMillis: Int,
+        document: DocumentIdentity,
     ): String {
-        val messageId = UUID.randomUUID().toString()
         val ext =
             buildJsonObject {
                 put("blockNotification", true)
                 put("currentPage", 0)
-                put("fileKey", documentKey)
-                put("msgId", messageId)
+                put("fileKey", document.fileKey)
+                put("msgId", document.msgId)
                 put("nextTotalParagraphSize", 0)
                 put("paragraphIndex", 0)
                 put("prevTotalParagraphSize", 0)
@@ -116,7 +197,7 @@ class MyvuDisplayRenderer(
                 put("sourceByteSize", text.encodeToByteArray().size)
                 put("sourceTextOffset", 0)
                 put("ticiMode", 1)
-                put("ticiSpeed", pacingMillis)
+                put("ticiSpeed", document.pacingMillis)
                 put("totalPage", 1)
                 put("totalPart", 1)
                 put("totalTextLength", text.length)
@@ -139,13 +220,13 @@ class MyvuDisplayRenderer(
 
     private fun sendContent(
         text: String,
-        documentKey: String,
+        document: DocumentIdentity,
     ): String {
         val content =
             buildJsonObject {
                 put("currentPage", 0)
-                put("fileKey", documentKey)
-                put("msgId", UUID.randomUUID().toString())
+                put("fileKey", document.fileKey)
+                put("msgId", document.msgId)
                 put("part", 0)
                 put("sourceText", text)
             }.toString()

@@ -9,16 +9,25 @@ import java.util.concurrent.TimeUnit
 
 class LocalSpeechPipelineTest {
     @Test
-    fun pooled_frames_keep_offer_order_and_report_overflow_once() {
+    fun pooled_frames_accept_exactly_two_seconds_of_audio_before_terminal_overflow() {
         val engine = RecordingEngine()
         val failures = mutableListOf<Throwable>()
         val pipeline = LocalSpeechPipeline(engine, onUtterance = {}, onFailure = failures::add)
 
-        assertTrue(pipeline.offer(ByteArray(640), 640))
-        assertTrue(pipeline.offer(ByteArray(640), 640))
+        assertEquals(100, LocalSpeechPipeline.FRAME_CAPACITY)
+        assertEquals(640, LocalSpeechPipeline.FRAME_BYTES)
+        assertTrue(pipeline.offer(ByteArray(LocalSpeechPipeline.FRAME_BYTES), LocalSpeechPipeline.FRAME_BYTES))
+        assertTrue(pipeline.offer(ByteArray(LocalSpeechPipeline.FRAME_BYTES), LocalSpeechPipeline.FRAME_BYTES))
         assertTrue(engine.started.await(2, TimeUnit.SECONDS))
-        repeat(25) { assertTrue(pipeline.offer(ByteArray(640) { it.toByte() }, 640)) }
-        assertFalse(pipeline.offer(ByteArray(640), 640))
+        repeat(LocalSpeechPipeline.FRAME_CAPACITY) {
+            assertTrue(
+                pipeline.offer(
+                    ByteArray(LocalSpeechPipeline.FRAME_BYTES) { it.toByte() },
+                    LocalSpeechPipeline.FRAME_BYTES,
+                ),
+            )
+        }
+        assertFalse(pipeline.offer(ByteArray(LocalSpeechPipeline.FRAME_BYTES), LocalSpeechPipeline.FRAME_BYTES))
         assertEquals(1, failures.filterIsInstance<LocalSpeechPipeline.OverflowException>().size)
         engine.completeAll()
         assertFalse(pipeline.offer(ByteArray(640), 640))
@@ -46,7 +55,7 @@ class LocalSpeechPipelineTest {
         assertTrue(pipeline.offer(ByteArray(640), 640))
         assertTrue(pipeline.offer(ByteArray(640), 640))
         assertTrue(engine.started.await(2, TimeUnit.SECONDS))
-        repeat(25) { assertTrue(pipeline.offer(ByteArray(640), 640)) }
+        repeat(LocalSpeechPipeline.FRAME_CAPACITY) { assertTrue(pipeline.offer(ByteArray(640), 640)) }
 
         assertFalse(pipeline.offer(ByteArray(640), 640))
         pipeline.close()
@@ -87,6 +96,9 @@ class LocalSpeechPipelineTest {
     private class RecordingEngine : SpeechEngine {
         private val callbacks = mutableListOf<(Result<WhisperNative.VadResult>) -> Unit>()
         private val inputs = mutableListOf<ByteArray>()
+
+        override fun warmUpVad(onResult: (Result<Unit>) -> Unit) = onResult(Result.success(Unit))
+
         val started = CountDownLatch(1)
 
         override fun vad(
